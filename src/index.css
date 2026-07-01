@@ -1,0 +1,230 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Warm terracotta-inspired palette for restaurant management */
+    --background: 30 25% 98%;
+    --foreground: 20 20% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 20 20% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 20 20% 15%;
+
+    /* Warm terracotta primary */
+    --primary: 18 76% 52%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Warm beige secondary */
+    --secondary: 30 30% 94%;
+    --secondary-foreground: 20 20% 25%;
+
+    --muted: 30 20% 94%;
+    --muted-foreground: 20 10% 45%;
+
+    /* Warm gold accent */
+    --accent: 38 92% 50%;
+    --accent-foreground: 20 20% 10%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Success green */
+    --success: 142 76% 36%;
+    --success-foreground: 0 0% 100%;
+
+    /* Warning amber */
+    --warning: 38 92% 50%;
+    --warning-foreground: 20 20% 10%;
+
+    --border: 30 20% 88%;
+    --input: 30 20% 88%;
+    --ring: 18 76% 52%;
+
+    --radius: 0.75rem;
+
+    /* Sidebar - Dark charcoal */
+    --sidebar-background: 20 20% 12%;
+    --sidebar-foreground: 30 20% 90%;
+    --sidebar-primary: 18 76% 52%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 20 20% 18%;
+    --sidebar-accent-foreground: 30 20% 90%;
+    --sidebar-border: 20 15% 20%;
+    --sidebar-ring: 18 76% 52%;
+
+    /* Custom design tokens */
+    --gradient-primary: linear-gradient(135deg, hsl(18 76% 52%) 0%, hsl(38 92% 50%) 100%);
+    --gradient-sidebar: linear-gradient(180deg, hsl(20 20% 12%) 0%, hsl(20 25% 8%) 100%);
+    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%) 0%, hsl(30 25% 98%) 100%);
+    
+    --shadow-sm: 0 1px 2px 0 hsl(20 20% 15% / 0.05);
+    --shadow-md: 0 4px 6px -1px hsl(20 20% 15% / 0.1), 0 2px 4px -2px hsl(20 20% 15% / 0.1);
+    --shadow-lg: 0 10px 15px -3px hsl(20 20% 15% / 0.1), 0 4px 6px -4px hsl(20 20% 15% / 0.1);
+    --shadow-glow: 0 0 20px hsl(18 76% 52% / 0.3);
+
+    /* Veg/Non-veg indicators */
+    --veg: 142 76% 36%;
+    --non-veg: 0 84% 45%;
+    --egg: 38 92% 50%;
+
+    /* Spice levels */
+    --spice-mild: 142 50% 50%;
+    --spice-medium: 38 92% 50%;
+    --spice-spicy: 18 76% 52%;
+    --spice-extra-spicy: 0 84% 50%;
+  }
+
+  .dark {
+    --background: 20 20% 8%;
+    --foreground: 30 20% 95%;
+
+    --card: 20 20% 12%;
+    --card-foreground: 30 20% 95%;
+
+    --popover: 20 20% 12%;
+    --popover-foreground: 30 20% 95%;
+
+    --primary: 18 76% 55%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 20 20% 18%;
+    --secondary-foreground: 30 20% 90%;
+
+    --muted: 20 20% 18%;
+    --muted-foreground: 30 15% 55%;
+
+    --accent: 38 92% 50%;
+    --accent-foreground: 20 20% 10%;
+
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 76% 42%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 55%;
+    --warning-foreground: 20 20% 10%;
+
+    --border: 20 15% 20%;
+    --input: 20 15% 20%;
+    --ring: 18 76% 55%;
+
+    --sidebar-background: 20 25% 6%;
+    --sidebar-foreground: 30 20% 90%;
+    --sidebar-primary: 18 76% 55%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 20 20% 12%;
+    --sidebar-accent-foreground: 30 20% 90%;
+    --sidebar-border: 20 15% 15%;
+    --sidebar-ring: 18 76% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'DM Sans', sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'DM Sans', sans-serif;
+    @apply font-semibold tracking-tight;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-card/80 backdrop-blur-sm border border-border/50 shadow-md;
+  }
+
+  .status-badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .status-pending {
+    @apply bg-warning/10 text-warning;
+  }
+
+  .status-cooking {
+    @apply bg-primary/10 text-primary animate-pulse;
+  }
+
+  .status-ready {
+    @apply bg-success/10 text-success;
+  }
+
+  .status-served {
+    @apply bg-muted text-muted-foreground;
+  }
+
+  .food-indicator {
+    @apply w-3 h-3 rounded-sm border-2;
+  }
+
+  .food-veg {
+    @apply border-success bg-success/20;
+  }
+
+  .food-non-veg {
+    @apply border-destructive bg-destructive/20;
+  }
+
+  .food-egg {
+    @apply border-warning bg-warning/20;
+  }
+}
+
+@layer utilities {
+  .animate-slide-up {
+    animation: slide-up 0.3s ease-out;
+  }
+
+  .animate-fade-in {
+    animation: fade-in 0.2s ease-out;
+  }
+
+  .animate-scale-in {
+    animation: scale-in 0.2s ease-out;
+  }
+
+  @keyframes slide-up {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes scale-in {
+    from {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+}
