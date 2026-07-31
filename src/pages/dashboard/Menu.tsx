@@ -52,6 +52,7 @@ interface MenuItem {
   kitchen_id: string | null;
   shortcut_code: string | null; // Keyboard shortcut (1-9)
   sort_order?: number | null;
+  is_gst_exempt?: number | boolean | null; // 1 = excluded from GST at billing
   created_at: string;
 }
 
@@ -127,6 +128,7 @@ export default function Menu() {
   const [itemCategoryId, setItemCategoryId] = useState('');
   const [itemKitchenId, setItemKitchenId] = useState('');
   const [itemShortcutCode, setItemShortcutCode] = useState(''); // Keyboard shortcut (1-9 for quick access, or any number for search)
+  const [itemGstExempt, setItemGstExempt] = useState(false); // Exclude this item from GST at billing
   const [draggedItemId, setDraggedItemId] = useState<string | null>(null); // Drag-to-reorder
 
   const fetchData = async () => {
@@ -296,6 +298,7 @@ export default function Menu() {
     setItemCategoryId('');
     setItemKitchenId('');
     setItemShortcutCode('');
+    setItemGstExempt(false);
     setEditingItem(null);
   };
 
@@ -312,6 +315,7 @@ export default function Menu() {
       setItemCategoryId(item.category_id);
       setItemKitchenId(item.kitchen_id || '');
       setItemShortcutCode(item.shortcut_code || '');
+      setItemGstExempt(Boolean(item.is_gst_exempt));
     } else {
       resetItemForm();
       if (categoryId) setItemCategoryId(categoryId);
@@ -334,6 +338,7 @@ export default function Menu() {
         category_id: itemCategoryId,
         kitchen_id: itemKitchenId || null,
         shortcut_code: itemShortcutCode || null,
+        is_gst_exempt: itemGstExempt ? 1 : 0,
         // New items append to the end; edits leave sort_order untouched.
         ...(editingItem ? { id: editingItem.id } : { sort_order: menuItems.length }),
       };
@@ -803,6 +808,18 @@ export default function Menu() {
                           id="item-available"
                           checked={itemAvailable}
                           onCheckedChange={setItemAvailable}
+                        />
+                      </div>
+
+                      <div className="col-span-2 flex items-center justify-between pt-2">
+                        <div>
+                          <Label htmlFor="item-gst-exempt">GST Exempt</Label>
+                          <p className="text-xs text-muted-foreground">No GST charged on this item when billing</p>
+                        </div>
+                        <Switch
+                          id="item-gst-exempt"
+                          checked={itemGstExempt}
+                          onCheckedChange={setItemGstExempt}
                         />
                       </div>
                     </div>

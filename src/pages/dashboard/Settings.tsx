@@ -52,6 +52,7 @@ export default function Settings() {
     print_qr_on_bill: true,
     payment_qr_content: '',
     lock_saved_items: false,
+    table_alert_minutes: '',
   });
 
   // Poll pending count
@@ -78,6 +79,7 @@ export default function Settings() {
         print_qr_on_bill: currentRestaurant.print_qr_on_bill !== false,
         payment_qr_content: (currentRestaurant as any).payment_qr_content || '',
         lock_saved_items: Boolean((currentRestaurant as any).lock_saved_items),
+        table_alert_minutes: ((currentRestaurant as any).table_alert_minutes ?? '')?.toString() || '',
       });
     }
   }, [currentRestaurant]);
@@ -210,6 +212,7 @@ export default function Settings() {
       print_qr_on_bill: form.print_qr_on_bill,
       payment_qr_content: form.payment_qr_content || null,
       lock_saved_items: form.lock_saved_items,
+      table_alert_minutes: form.table_alert_minutes ? Math.max(0, Math.floor(parseFloat(form.table_alert_minutes))) : 0,
     };
 
     try {
@@ -230,6 +233,7 @@ export default function Settings() {
               print_qr_on_bill: updatedData.print_qr_on_bill,
               payment_qr_content: updatedData.payment_qr_content,
               lock_saved_items: updatedData.lock_saved_items,
+              table_alert_minutes: updatedData.table_alert_minutes,
             } as any)
             .eq('id', currentRestaurant.id)
             .select()
@@ -256,6 +260,7 @@ export default function Settings() {
           print_qr_on_bill: updatedData.print_qr_on_bill,
           payment_qr_content: updatedData.payment_qr_content,
           lock_saved_items: updatedData.lock_saved_items,
+          table_alert_minutes: updatedData.table_alert_minutes,
         };
         // Update localStorage cache
         localStorage.setItem('restroflow_current_restaurant', JSON.stringify(updatedRestaurant));
@@ -270,6 +275,7 @@ export default function Settings() {
           print_qr_on_bill: updatedData.print_qr_on_bill,
           payment_qr_content: updatedData.payment_qr_content || '',
           lock_saved_items: updatedData.lock_saved_items,
+          table_alert_minutes: updatedData.table_alert_minutes?.toString() || '',
         });
       }
       
@@ -445,6 +451,25 @@ export default function Settings() {
                 id="lock-saved-items"
                 checked={form.lock_saved_items}
                 onCheckedChange={(checked) => setForm({ ...form, lock_saved_items: checked })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border p-4">
+              <div className="space-y-0.5 pr-4">
+                <Label htmlFor="table-alert-minutes" className="text-base">Table Time Alert (minutes)</Label>
+                <p className="text-sm text-muted-foreground">
+                  Alert (red flashing + beep on the Order Kiosk) when a table stays booked longer than this many minutes. Set 0 to turn the alert off.
+                </p>
+              </div>
+              <Input
+                id="table-alert-minutes"
+                type="number"
+                min="0"
+                inputMode="numeric"
+                className="w-24"
+                value={form.table_alert_minutes}
+                onChange={(e) => setForm({ ...form, table_alert_minutes: e.target.value })}
+                placeholder="0"
               />
             </div>
 

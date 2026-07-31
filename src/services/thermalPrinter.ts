@@ -34,6 +34,38 @@ export interface BillData {
   total: number;
 }
 
+/**
+ * Group raw order_items by display name (dine/parcel copies of the same dish are
+ * shown as separate, labelled lines) into the print-ready shape both the
+ * BillingDialog and the Ctrl+P quick-print path need. Single source of truth so
+ * the two entry points can never format a bill differently.
+ */
+export function groupOrderItemsForBill(
+  items: { menu_item?: { name: string }; quantity: number; unit_price: number; is_parcel?: number | boolean }[]
+): { name: string; quantity: number; unit_price: number; total: number }[] {
+  const grouped = new Map<string, { name: string; quantity: number; unit_price: number; total: number }>();
+
+  items.forEach(item => {
+    const isParcel = Boolean(item.is_parcel);
+    const baseName = item.menu_item?.name || 'Item';
+    const name = isParcel ? `${baseName} (Parcel)` : baseName;
+    if (grouped.has(name)) {
+      const existing = grouped.get(name)!;
+      existing.quantity += item.quantity;
+      existing.total += item.unit_price * item.quantity;
+    } else {
+      grouped.set(name, {
+        name,
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        total: item.unit_price * item.quantity,
+      });
+    }
+  });
+
+  return Array.from(grouped.values());
+}
+
 export interface SummaryPrintData {
   restaurantName: string;
   restaurantAddress?: string | null;
@@ -41,6 +73,9 @@ export interface SummaryPrintData {
   tableNumber?: string;
   floorName?: string;
   billNumber?: number;
+  /** Heading printed on the ticket. Defaults to "ORDER SUMMARY"; the parcel KOT
+   *  passes "PARCEL / TAKEAWAY" so the kitchen knows to pack these items. */
+  title?: string;
   items: {
     name: string;
     quantity: number;
@@ -424,7 +459,8 @@ class ThermalPrinterService {
         .text('--------------------------------\n')
         .align('center')
         .bold()
-        .text('ORDER SUMMARY\n')
+        .doubleWidth()
+        .text(`${summary.title || 'ORDER SUMMARY'}\n`)
         .clearFormatting()
         .align('left');
 
@@ -519,7 +555,7 @@ class ThermalPrinterService {
             ${summary.restaurantPhone ? `<div class="info">Phone: ${summary.restaurantPhone}</div>` : ''}
           </div>
           <div class="divider"></div>
-          <div style="text-align: center; font-weight: bold; margin: 10px 0;">ORDER SUMMARY</div>
+          <div style="text-align: center; font-weight: bold; font-size: 15px; margin: 10px 0;">${summary.title || 'ORDER SUMMARY'}</div>
           <div class="divider"></div>
           <div class="info">
             ${summary.floorName && summary.tableNumber ? `<div>Floor: ${summary.floorName}</div>` : ''}

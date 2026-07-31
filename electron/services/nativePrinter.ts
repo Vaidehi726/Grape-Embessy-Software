@@ -48,6 +48,9 @@ export class NativePrinterService {
   private iface: any = null;
   private rawPortName: string | null = null; // Windows raw port fallback
   private rawPrinterName: string | null = null; // Windows printer name for spooler API
+  // printer name → resolved Windows port, so we don't spawn PowerShell (Get-Printer)
+  // on every print. A printer's port is effectively static for a session.
+  private static portCache = new Map<string, string>();
 
   /**
    * List all USB devices that could be thermal printers.
@@ -345,13 +348,24 @@ export class NativePrinterService {
     if (!this.rawPortName) {
       throw new Error('Cannot switch printer: not connected via Windows spooler.');
     }
-    
-    // Get the port for the new printer
-    const portInfo = this.getPrinterPort(printerName);
+
+    // Fast path: already targeting this printer — skip the port lookup entirely.
+    // This is what makes REPEAT prints instant: printer:print-windows-printer
+    // calls switchWindowsPrinter on every print, and getPrinterPort() spawns a
+    // PowerShell Get-Printer (~1-2s). For the common "same printer every time"
+    // case we do zero work here.
+    if (this.rawPrinterName === printerName) return;
+
+    // Otherwise resolve the port, caching it so switching back later is also free.
+    let portInfo = NativePrinterService.portCache.get(printerName) || null;
+    if (!portInfo) {
+      portInfo = this.getPrinterPort(printerName);
+      if (portInfo) NativePrinterService.portCache.set(printerName, portInfo);
+    }
     if (!portInfo) {
       throw new Error(`Could not find port for printer "${printerName}".`);
     }
-    
+
     this.rawPrinterName = printerName;
     this.rawPortName = portInfo;
     console.log(`[NativePrinter] Switched to Windows printer: "${printerName}" on port ${portInfo}`);
@@ -449,7 +463,16 @@ export class NativePrinterService {
   }
 
   /**
-   * Print via Windows Print Spooler API (uses PowerShell + winspool.drv)
+   * Print via Windows Print Spooler API.
+   *
+   * Sends raw ESC/POS bytes through a tiny pre-compiled helper (rawprint.exe,
+   * built once via ensureRawPrintExe()) instead of shelling out to PowerShell
+   * and recompiling an inline C# type on every single print. That old path
+   * spawned a fresh powershell.exe and ran `Add-Type` (JIT-compiling the P/Invoke
+   * class from source) on EVERY print — 2-3 seconds of pure compile/startup
+   * overhead each time, even though the printer itself responds in milliseconds.
+   * Compiling once and reusing the binary cuts each print to just a process
+   * spawn (tens of milliseconds).
    */
   private async printViaRawPort(data: Buffer): Promise<void> {
     if (!this.rawPrinterName) {
@@ -459,52 +482,155 @@ export class NativePrinterService {
     const tmpFile = path.join(os.tmpdir(), `receipt_${Date.now()}.bin`);
     try {
       fs.writeFileSync(tmpFile, data);
-
-      // Use PowerShell with winspool.drv P/Invoke to send raw ESC/POS data
-      const escapedFile = tmpFile.replace(/\\/g, '\\\\');
-      const escapedPrinter = this.rawPrinterName.replace(/'/g, "''");
-
-      const psScript = `
-Add-Type -TypeDefinition @'
-using System;using System.Runtime.InteropServices;
-public class RP{
-[StructLayout(LayoutKind.Sequential)]public struct DI{[MarshalAs(UnmanagedType.LPStr)]public string n;[MarshalAs(UnmanagedType.LPStr)]public string o;[MarshalAs(UnmanagedType.LPStr)]public string d;}
-[DllImport("winspool.drv",EntryPoint="OpenPrinterA",SetLastError=true)]public static extern bool OpenPrinter(string s,out IntPtr h,IntPtr p);
-[DllImport("winspool.drv",EntryPoint="StartDocPrinterA",SetLastError=true)]public static extern bool StartDocPrinter(IntPtr h,int l,ref DI d);
-[DllImport("winspool.drv",EntryPoint="StartPagePrinter",SetLastError=true)]public static extern bool StartPagePrinter(IntPtr h);
-[DllImport("winspool.drv",EntryPoint="WritePrinter",SetLastError=true)]public static extern bool WritePrinter(IntPtr h,IntPtr b,int c,out int w);
-[DllImport("winspool.drv",EntryPoint="EndPagePrinter",SetLastError=true)]public static extern bool EndPagePrinter(IntPtr h);
-[DllImport("winspool.drv",EntryPoint="EndDocPrinter",SetLastError=true)]public static extern bool EndDocPrinter(IntPtr h);
-[DllImport("winspool.drv",EntryPoint="ClosePrinter",SetLastError=true)]public static extern bool ClosePrinter(IntPtr h);
-[DllImport("kernel32.dll")]public static extern int GetLastError();
-public static bool Send(string pn,byte[] bs,out string err){err="";IntPtr hp;DI di=new DI();di.n="Receipt";di.d="RAW";
-if(!OpenPrinter(pn,out hp,IntPtr.Zero)){err="OpenPrinter failed, error="+GetLastError();return false;}
-if(!StartDocPrinter(hp,1,ref di)){err="StartDocPrinter failed";ClosePrinter(hp);return false;}
-if(!StartPagePrinter(hp)){err="StartPagePrinter failed";EndDocPrinter(hp);ClosePrinter(hp);return false;}
-IntPtr pb=Marshal.AllocCoTaskMem(bs.Length);Marshal.Copy(bs,0,pb,bs.Length);int w;bool ok=WritePrinter(hp,pb,bs.Length,out w);
-if(!ok)err="WritePrinter failed";Marshal.FreeCoTaskMem(pb);EndPagePrinter(hp);EndDocPrinter(hp);ClosePrinter(hp);return ok;}}
-'@
-$b=[IO.File]::ReadAllBytes('${escapedFile}')
-[string]$err=""
-if([RP]::Send('${escapedPrinter}',$b,[ref]$err)){Write-Output 'OK'}else{Write-Error "Print failed: $err";exit 1}
-`.trim();
-
-      // Write PS script to temp file to avoid command line escaping issues
-      const psFile = tmpFile + '.ps1';
-      fs.writeFileSync(psFile, psScript);
-
-      execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${psFile}"`, {
-        timeout: 20000,
+      const exePath = this.ensureRawPrintExe();
+      execSync(`"${exePath}" "${this.rawPrinterName.replace(/"/g, '\\"')}" "${tmpFile}"`, {
+        timeout: 8000,
         windowsHide: true,
       });
       console.log(`[NativePrinter] Printed ${data.length} bytes via Windows spooler to "${this.rawPrinterName}"`);
-
-      try { fs.unlinkSync(psFile); } catch { /* ignore */ }
     } catch (err: any) {
       throw new Error(`Failed to print to "${this.rawPrinterName}": ${err.message}`);
     } finally {
       try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
     }
+  }
+
+  private static rawPrintExePath: string | null = null;
+
+  /**
+   * Build (once, cached) a tiny native helper that sends raw bytes to a Windows
+   * printer via the winspool.drv P/Invoke API — the same approach the old inline
+   * PowerShell script used, just compiled ahead of time instead of on every call.
+   * The compiled exe is cached in the OS temp dir and reused across app restarts;
+   * only the very first print after an install/update pays the ~1-2s compile cost.
+   */
+  private ensureRawPrintExe(): string {
+    if (NativePrinterService.rawPrintExePath && fs.existsSync(NativePrinterService.rawPrintExePath)) {
+      return NativePrinterService.rawPrintExePath;
+    }
+
+    const dir = path.join(os.tmpdir(), 'grape-embassy-printer');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const exePath = path.join(dir, 'rawprint.exe');
+
+    if (fs.existsSync(exePath)) {
+      NativePrinterService.rawPrintExePath = exePath;
+      return exePath;
+    }
+
+    const csc = this.findCsc();
+    if (!csc) {
+      throw new Error(
+        'C# compiler (csc.exe) not found — required once to build the fast print helper. ' +
+        'This ships with Windows (.NET Framework) on virtually every install.'
+      );
+    }
+
+    const source = `
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public class RawPrint {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DOCINFO {
+        [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+        [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+        [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+    }
+
+    [DllImport("winspool.drv", EntryPoint = "OpenPrinterA", SetLastError = true, CharSet = CharSet.Ansi)]
+    public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
+    [DllImport("winspool.drv", EntryPoint = "StartDocPrinterA", SetLastError = true, CharSet = CharSet.Ansi)]
+    public static extern bool StartDocPrinter(IntPtr hPrinter, int level, ref DOCINFO pDocInfo);
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool StartPagePrinter(IntPtr hPrinter);
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool EndPagePrinter(IntPtr hPrinter);
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool EndDocPrinter(IntPtr hPrinter);
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool ClosePrinter(IntPtr hPrinter);
+
+    public static int Main(string[] args) {
+        if (args.Length < 2) {
+            Console.Error.WriteLine("Usage: rawprint.exe <printerName> <filePath>");
+            return 1;
+        }
+        string printerName = args[0];
+        byte[] bytes = File.ReadAllBytes(args[1]);
+
+        IntPtr hPrinter;
+        if (!OpenPrinter(printerName, out hPrinter, IntPtr.Zero)) {
+            Console.Error.WriteLine("OpenPrinter failed: " + Marshal.GetLastWin32Error());
+            return 1;
+        }
+        try {
+            DOCINFO di = new DOCINFO();
+            di.pDocName = "Receipt";
+            di.pDataType = "RAW";
+            if (!StartDocPrinter(hPrinter, 1, ref di)) {
+                Console.Error.WriteLine("StartDocPrinter failed: " + Marshal.GetLastWin32Error());
+                return 1;
+            }
+            try {
+                if (!StartPagePrinter(hPrinter)) {
+                    Console.Error.WriteLine("StartPagePrinter failed: " + Marshal.GetLastWin32Error());
+                    return 1;
+                }
+                IntPtr pUnmanaged = Marshal.AllocCoTaskMem(bytes.Length);
+                try {
+                    Marshal.Copy(bytes, 0, pUnmanaged, bytes.Length);
+                    int written;
+                    if (!WritePrinter(hPrinter, pUnmanaged, bytes.Length, out written)) {
+                        Console.Error.WriteLine("WritePrinter failed: " + Marshal.GetLastWin32Error());
+                        return 1;
+                    }
+                } finally {
+                    Marshal.FreeCoTaskMem(pUnmanaged);
+                }
+                EndPagePrinter(hPrinter);
+            } finally {
+                EndDocPrinter(hPrinter);
+            }
+        } finally {
+            ClosePrinter(hPrinter);
+        }
+        Console.WriteLine("OK");
+        return 0;
+    }
+}
+`.trim();
+
+    const srcPath = path.join(dir, 'rawprint.cs');
+    fs.writeFileSync(srcPath, source);
+
+    try {
+      execSync(`"${csc}" /nologo /target:exe /out:"${exePath}" "${srcPath}"`, {
+        timeout: 30000,
+        windowsHide: true,
+      });
+    } catch (err: any) {
+      throw new Error(`Failed to build print helper: ${err.message}`);
+    }
+
+    NativePrinterService.rawPrintExePath = exePath;
+    return exePath;
+  }
+
+  /** Locate csc.exe, which ships with every .NET Framework install on Windows. */
+  private findCsc(): string | null {
+    const windir = process.env.WINDIR || 'C:\\Windows';
+    const candidates = [
+      path.join(windir, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+      path.join(windir, 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe'),
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    return null;
   }
 
   /**

@@ -625,6 +625,8 @@ export default function Reports() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(true);
   const [dateRange, setDateRange] = useState<DateRange>('today');
+  // How the Top Floors / Top Tables ranking is ordered: by revenue or order count.
+  const [perfSortBy, setPerfSortBy] = useState<'revenue' | 'orders'>('revenue');
   const [customDateFrom, setCustomDateFrom] = useState<Date | undefined>(undefined);
   const [customDateTo, setCustomDateTo] = useState<Date | undefined>(undefined);
   const [statusFilter, setStatusFilter] = useState<string>('all');
@@ -1070,6 +1072,39 @@ export default function Reports() {
       });
     return Array.from(itemMap.values()).sort((a, b) => b.quantity - a.quantity);
   }, [orders]);
+
+  // Best-performing floors and tables for the selected period. Revenue uses the
+  // same basis as the headline stats (served orders' total_amount) so the numbers
+  // reconcile. Tables are keyed by floor+number so identically-named tables on
+  // different floors don't merge. Respects the existing date-range filter.
+  const floorTablePerformance = useMemo(() => {
+    const floorMap = new Map<string, { name: string; revenue: number; orders: number }>();
+    const tableMap = new Map<string, { name: string; floor: string; revenue: number; orders: number }>();
+
+    orders
+      .filter(o => o.status === 'served')
+      .forEach(order => {
+        const floorName = order.table?.floor?.name || 'Unknown';
+        const tableNumber = order.table?.table_number || '—';
+        const revenue = Number(order.total_amount) || 0;
+
+        const f = floorMap.get(floorName) || { name: floorName, revenue: 0, orders: 0 };
+        floorMap.set(floorName, { name: floorName, revenue: f.revenue + revenue, orders: f.orders + 1 });
+
+        const key = `${floorName}||${tableNumber}`;
+        const t = tableMap.get(key) || { name: tableNumber, floor: floorName, revenue: 0, orders: 0 };
+        tableMap.set(key, { name: tableNumber, floor: floorName, revenue: t.revenue + revenue, orders: t.orders + 1 });
+      });
+
+    // Rank by revenue (amount) or by order count, per the toggle.
+    const cmp = (a: { revenue: number; orders: number }, b: { revenue: number; orders: number }) =>
+      perfSortBy === 'orders' ? b.orders - a.orders : b.revenue - a.revenue;
+
+    return {
+      floors: Array.from(floorMap.values()).sort(cmp),
+      tables: Array.from(tableMap.values()).sort(cmp).slice(0, 10),
+    };
+  }, [orders, perfSortBy]);
 
   // Hourly data for today
   const hourlyData = useMemo(() => {
@@ -1943,6 +1978,109 @@ export default function Reports() {
                         <Bar dataKey="revenue" name="Revenue (₹)" fill="hsl(38, 92%, 50%)" radius={[0, 4, 4, 0]} />
                       </BarChart>
                     </ResponsiveContainer>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Best Performing Floors */}
+              <Card className="glass-card">
+                <CardHeader>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <CardTitle>Top Floors</CardTitle>
+                      <CardDescription>Ranked by {perfSortBy === 'orders' ? 'order count' : 'amount'} for the selected period</CardDescription>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <Button variant={perfSortBy === 'revenue' ? 'default' : 'outline'} size="sm" className="h-7 px-2 text-xs" onClick={() => setPerfSortBy('revenue')}>Amount</Button>
+                      <Button variant={perfSortBy === 'orders' ? 'default' : 'outline'} size="sm" className="h-7 px-2 text-xs" onClick={() => setPerfSortBy('orders')}>Orders</Button>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {loading ? (
+                    <div className="h-[200px] bg-muted animate-pulse rounded-lg" />
+                  ) : floorTablePerformance.floors.length === 0 ? (
+                    <div className="h-[120px] flex items-center justify-center text-muted-foreground">
+                      No sales in this period
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {floorTablePerformance.floors.map((floor, index) => (
+                        <div key={floor.name} className="flex items-center justify-between p-3 rounded-lg bg-muted/40">
+                          <div className="flex items-center gap-3">
+                            <span className="w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-semibold flex items-center justify-center">
+                              {index + 1}
+                            </span>
+                            <p className="font-medium text-sm">{floor.name}</p>
+                          </div>
+                          <div className="text-right">
+                            <div className="font-bold text-sm">
+                              {perfSortBy === 'orders'
+                                ? `${floor.orders} order${floor.orders !== 1 ? 's' : ''}`
+                                : `₹${Math.round(floor.revenue).toLocaleString('en-IN')}`}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {perfSortBy === 'orders'
+                                ? `₹${Math.round(floor.revenue).toLocaleString('en-IN')}`
+                                : `${floor.orders} order${floor.orders !== 1 ? 's' : ''}`}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Best Performing Tables */}
+              <Card className="glass-card">
+                <CardHeader>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <CardTitle>Top Tables</CardTitle>
+                      <CardDescription>Top 10 by {perfSortBy === 'orders' ? 'order count' : 'amount'} for the selected period</CardDescription>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <Button variant={perfSortBy === 'revenue' ? 'default' : 'outline'} size="sm" className="h-7 px-2 text-xs" onClick={() => setPerfSortBy('revenue')}>Amount</Button>
+                      <Button variant={perfSortBy === 'orders' ? 'default' : 'outline'} size="sm" className="h-7 px-2 text-xs" onClick={() => setPerfSortBy('orders')}>Orders</Button>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {loading ? (
+                    <div className="h-[200px] bg-muted animate-pulse rounded-lg" />
+                  ) : floorTablePerformance.tables.length === 0 ? (
+                    <div className="h-[120px] flex items-center justify-center text-muted-foreground">
+                      No sales in this period
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {floorTablePerformance.tables.map((table, index) => (
+                        <div key={`${table.floor}-${table.name}`} className="flex items-center justify-between p-3 rounded-lg bg-muted/40">
+                          <div className="flex items-center gap-3">
+                            <span className="w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-semibold flex items-center justify-center">
+                              {index + 1}
+                            </span>
+                            <div>
+                              <p className="font-medium text-sm">Table {table.name}</p>
+                              <p className="text-xs text-muted-foreground">{table.floor}</p>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="font-bold text-sm">
+                              {perfSortBy === 'orders'
+                                ? `${table.orders} order${table.orders !== 1 ? 's' : ''}`
+                                : `₹${Math.round(table.revenue).toLocaleString('en-IN')}`}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {perfSortBy === 'orders'
+                                ? `₹${Math.round(table.revenue).toLocaleString('en-IN')}`
+                                : `${table.orders} order${table.orders !== 1 ? 's' : ''}`}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </CardContent>
               </Card>

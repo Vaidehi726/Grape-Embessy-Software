@@ -2,6 +2,7 @@
 // Detects environment automatically and routes to the correct implementation
 
 import { usbPrinter, USBPrinterDevice } from './usbPrinter';
+import { thermalPrinter } from './thermalPrinter';
 import type { BillData, SummaryPrintData } from './thermalPrinter';
 
 // Type for the Electron API exposed via preload
@@ -48,6 +49,71 @@ export const printerBridge: PrinterBridge = {
   printWindows: (bill, printerName) => getPrinterBridge().printWindows?.(bill, printerName) ?? Promise.resolve({ success: false, error: 'Not available' }),
   printWindowsSummary: (summary, printerName) => getPrinterBridge().printWindowsSummary?.(summary, printerName) ?? Promise.resolve({ success: false, error: 'Not available' }),
 };
+
+/**
+ * Print the full priced bill to whatever printer is available — same preference
+ * order as printSummaryAuto (USB → first Windows printer → browser). Used by the
+ * Ctrl+P "quick print" shortcut so a cashier isn't forced through the Billing
+ * dialog's print button when the printer is already known.
+ */
+export async function printBillAuto(bill: BillData): Promise<'usb' | 'windows' | 'browser'> {
+  const bridge = getPrinterBridge();
+
+  if (bridge.getConnectedPrinter()) {
+    await bridge.printBill(bill);
+    return 'usb';
+  }
+
+  if (isElectron() && bridge.listWindowsPrinters && bridge.printWindows) {
+    try {
+      const printers = await bridge.listWindowsPrinters();
+      if (printers.length > 0) {
+        const res = await bridge.printWindows(bill, printers[0]);
+        if (res.success) return 'windows';
+        throw new Error(res.error || 'Windows print failed');
+      }
+    } catch (e) {
+      console.warn('[printBillAuto] Windows print failed, falling back to browser:', e);
+    }
+  }
+
+  thermalPrinter.printViaBrowser(bill);
+  return 'browser';
+}
+
+/**
+ * Print a kitchen/parcel summary to whatever printer is available, so callers
+ * (e.g. the cart's "Print Parcel KOT" button) don't need to know the method.
+ * Preference: connected USB thermal printer → first installed Windows printer →
+ * browser print dialog. Returns a short label of the method used for a toast.
+ */
+export async function printSummaryAuto(summary: SummaryPrintData): Promise<'usb' | 'windows' | 'browser'> {
+  const bridge = getPrinterBridge();
+
+  // 1. A connected USB thermal printer — fastest, already selected.
+  if (bridge.getConnectedPrinter()) {
+    await bridge.printSummary(summary);
+    return 'usb';
+  }
+
+  // 2. Electron: first installed Windows printer.
+  if (isElectron() && bridge.listWindowsPrinters && bridge.printWindowsSummary) {
+    try {
+      const printers = await bridge.listWindowsPrinters();
+      if (printers.length > 0) {
+        const res = await bridge.printWindowsSummary(summary, printers[0]);
+        if (res.success) return 'windows';
+        throw new Error(res.error || 'Windows print failed');
+      }
+    } catch (e) {
+      console.warn('[printSummaryAuto] Windows print failed, falling back to browser:', e);
+    }
+  }
+
+  // 3. Browser print dialog fallback.
+  thermalPrinter.printSummaryViaBrowser(summary);
+  return 'browser';
+}
 
 // ── ESC/POS QR Code builder (GS ( k commands) ──────────────────
 // Builds ESC/POS QR code bytes for the given text content
@@ -339,7 +405,9 @@ function buildSummaryReceipt(summary: SummaryPrintData): Uint8Array {
 
   add(CMD.ALIGN_CENTER);
   add(CMD.BOLD_ON);
-  text('ORDER SUMMARY'); nl();
+  add(CMD.DOUBLE_WIDTH_ON);
+  text(summary.title || 'ORDER SUMMARY'); nl();
+  add(CMD.DOUBLE_WIDTH_OFF);
   add(CMD.BOLD_OFF);
   text('--------------------------------'); nl();
 

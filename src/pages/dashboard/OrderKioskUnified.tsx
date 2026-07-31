@@ -31,6 +31,7 @@ import {
   Check,
   FileText,
   ArrowLeftRight,
+  Package,
 } from 'lucide-react';
 import {
   Dialog,
@@ -41,6 +42,8 @@ import {
 } from '@/components/ui/dialog';
 import { useThermalPrinter } from '@/hooks/useThermalPrinter';
 import { useUSBPrinter } from '@/hooks/useUSBPrinter';
+import { printSummaryAuto, printBillAuto } from '@/services/printerBridge';
+import { groupOrderItemsForBill } from '@/services/thermalPrinter';
 import { TableOccupiedTimer } from '@/components/TableOccupiedTimer';
 import { BillingDialog } from '@/components/BillingDialog';
 import { getNextBillNumber } from '@/services/dailyBillNumber';
@@ -77,6 +80,7 @@ interface MenuItem {
   category_id: string;
   kitchen_id: string | null;
   shortcut_code?: string | null;
+  is_gst_exempt?: number | boolean | null;
 }
 
 // Unified cart item - simple, no status tracking
@@ -91,6 +95,7 @@ interface UnifiedCartItem {
   isNew: boolean;               // true = new item, false = from existing order
   isModified: boolean;          // true = quantity changed from original
   originalQuantity?: number;    // Original quantity (for tracking changes)
+  isParcel: boolean;            // true = takeaway/parcel item (billed together, separate KOT)
 }
 
 const FoodTypeIndicator = ({ type }: { type: 'veg' | 'non_veg' | 'egg' }) => {
@@ -121,6 +126,26 @@ const SpiceLevelIndicator = ({ level }: { level: 'mild' | 'medium' | 'spicy' | '
     </div>
   );
 };
+
+// Short two-tone alert beep via the Web Audio API — no sound file needed. Used
+// when a table crosses the "booked too long" threshold.
+function playAlertBeep() {
+  try {
+    const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    gain.gain.value = 0.08;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    setTimeout(() => { osc.frequency.value = 660; }, 160);
+    setTimeout(() => { try { osc.stop(); ctx.close(); } catch { /* ignore */ } }, 420);
+  } catch { /* audio not available — silent */ }
+}
 
 export default function OrderKioskSplit() {
   const { currentRestaurant } = useRestaurant();
@@ -161,6 +186,8 @@ export default function OrderKioskSplit() {
   const lastBillSearchRef = useRef<string>('');
   const lanRefreshTimerRef = useRef<any>(null);
   const kioskRootRef = useRef<HTMLDivElement>(null);
+  // Guards Ctrl+P against a rapid double-fire reserving two bill numbers / double-printing.
+  const quickPrintingRef = useRef(false);
   
   const { printBill: printThermal } = useThermalPrinter();
   const { printBill: printUSB } = useUSBPrinter();
@@ -168,6 +195,21 @@ export default function OrderKioskSplit() {
   // When enabled in Settings, items already saved to an order can only be
   // increased — never reduced or removed — so a taken order can't be lowered.
   const lockSavedItems = Boolean((currentRestaurant as any)?.lock_saved_items);
+
+  // Table over-time alert: threshold (minutes) is set on the server Settings page
+  // and rides the restaurants row over LAN, so client stations honour it too.
+  const alertMinutes = Number((currentRestaurant as any)?.table_alert_minutes) || 0;
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const beepedTablesRef = useRef<Set<string>>(new Set());
+
+  // A table is "over time" if it's been occupied longer than the threshold.
+  const isTableOverTime = useCallback((tableId: string): boolean => {
+    if (alertMinutes <= 0) return false;
+    const since = tableOccupationTimes[tableId];
+    if (!since) return false;
+    const mins = (nowTick - new Date(since).getTime()) / 60000;
+    return mins > alertMinutes;
+  }, [alertMinutes, tableOccupationTimes, nowTick]);
 
   // ============================================================================
   // DATA FETCHING
@@ -295,7 +337,29 @@ export default function OrderKioskSplit() {
     return () => clearInterval(interval);
   }, [currentRestaurant]);
 
-  // Grab keyboard focus when the kiosk mounts so shortcuts (Ctrl+T, /, 1-9,
+  // Tick every 20s so the over-time alert re-evaluates without a data refetch.
+  useEffect(() => {
+    if (alertMinutes <= 0) return;
+    const id = setInterval(() => setNowTick(Date.now()), 20000);
+    return () => clearInterval(id);
+  }, [alertMinutes]);
+
+  // Beep once when a table first crosses the threshold; re-arm it once the table
+  // is freed / falls back under the limit so a later re-occupation beeps again.
+  useEffect(() => {
+    if (alertMinutes <= 0) return;
+    const overIds = new Set(
+      floors.flatMap(f => f.tables).filter(t => t.is_occupied && isTableOverTime(t.id)).map(t => t.id)
+    );
+    let shouldBeep = false;
+    overIds.forEach(id => {
+      if (!beepedTablesRef.current.has(id)) { shouldBeep = true; beepedTablesRef.current.add(id); }
+    });
+    beepedTablesRef.current.forEach(id => { if (!overIds.has(id)) beepedTablesRef.current.delete(id); });
+    if (shouldBeep) playAlertBeep();
+  }, [nowTick, floors, alertMinutes, isTableOverTime]);
+
+  // Grab keyboard focus when the kiosk mounts so shortcuts (Ctrl+A, /, 1-9,
   // Enter…) work immediately after arriving via the global Ctrl+K — without
   // first having to click the page to give the document focus.
   useEffect(() => {
@@ -381,7 +445,8 @@ export default function OrderKioskSplit() {
               unitPrice: orderItem.unit_price,
               isNew: false,
               isModified: false,
-              originalQuantity: orderItem.quantity
+              originalQuantity: orderItem.quantity,
+              isParcel: Boolean(orderItem.is_parcel),
             });
           }
         }
@@ -504,27 +569,71 @@ export default function OrderKioskSplit() {
     }
   };
 
-  // Add to cart - simple increment or add new
-  const addToCart = (menuItem: MenuItem) => {
+  // Add to cart - simple increment or add new. Parcel and dine copies of the same
+  // dish are tracked as SEPARATE lines (keyed by id + parcel flag) so one can be
+  // dine-in and another takeaway on the same order.
+  const addToCart = (menuItem: MenuItem, isParcel = false) => {
     setUnifiedCart(prev => {
-      const existingItem = prev.find(item => item.menuItem.id === menuItem.id);
-      
+      const existingItem = prev.find(
+        item => item.menuItem.id === menuItem.id && item.isParcel === isParcel
+      );
+
       if (existingItem) {
         return prev.map(item =>
-          item.menuItem.id === menuItem.id
+          item.cartItemId === existingItem.cartItemId
             ? { ...item, quantity: item.quantity + 1, isModified: true }
             : item
         );
       }
-      
+
       return [...prev, {
         cartItemId: crypto.randomUUID(),
         menuItem,
         quantity: 1,
         unitPrice: menuItem.price,
         isNew: true,
-        isModified: false
+        isModified: false,
+        isParcel,
       }];
+    });
+  };
+
+  // Move ONE unit of a cart line between dine-in and parcel. This is what lets a
+  // single "Misal x5" be split into e.g. 3 dine-in + 2 parcel: tap "To Parcel"
+  // twice on the dine line. The moved unit lands on the same dish's line of the
+  // target type (created if it doesn't exist yet); the source line shrinks by one
+  // and disappears at zero. The total quantity billed never changes — units are
+  // only reclassified — so this is allowed even when saved items are locked.
+  const moveUnit = (cartItemId: string, toParcel: boolean) => {
+    setUnifiedCart(prev => {
+      const src = prev.find(i => i.cartItemId === cartItemId);
+      if (!src || src.isParcel === toParcel || src.quantity < 1) return prev;
+
+      const sibling = prev.find(
+        i => i.cartItemId !== cartItemId && i.menuItem.id === src.menuItem.id && i.isParcel === toParcel
+      );
+
+      let next = prev.map(i => {
+        if (i.cartItemId === cartItemId) return { ...i, quantity: i.quantity - 1, isModified: true };
+        if (sibling && i.cartItemId === sibling.cartItemId) return { ...i, quantity: i.quantity + 1, isModified: true };
+        return i;
+      });
+
+      if (!sibling) {
+        // The moved unit becomes a NEW order_item row of the target type.
+        next = [...next, {
+          cartItemId: crypto.randomUUID(),
+          menuItem: src.menuItem,
+          quantity: 1,
+          unitPrice: src.unitPrice,
+          isNew: true,
+          isModified: true,
+          isParcel: toParcel,
+        }];
+      }
+
+      // Drop any line that dropped to zero.
+      return next.filter(i => i.quantity > 0);
     });
   };
 
@@ -596,8 +705,17 @@ export default function OrderKioskSplit() {
   // GST-inclusive total shown on the cart, so it matches what the customer pays.
   const cartCgstPct = (currentRestaurant as any)?.cgst_percentage || 0;
   const cartSgstPct = (currentRestaurant as any)?.sgst_percentage || 0;
-  const cartCgstAmount = (totalAmount * cartCgstPct) / 100;
-  const cartSgstAmount = (totalAmount * cartSgstPct) / 100;
+  // GST is charged only on non-exempt items. Exempt items still count toward the
+  // subtotal/total, just not toward the tax.
+  const cartTaxableSubtotal = useMemo(
+    () => unifiedCart.reduce(
+      (sum, item) => sum + (Boolean(item.menuItem.is_gst_exempt) ? 0 : item.unitPrice * item.quantity),
+      0
+    ),
+    [unifiedCart]
+  );
+  const cartCgstAmount = (cartTaxableSubtotal * cartCgstPct) / 100;
+  const cartSgstAmount = (cartTaxableSubtotal * cartSgstPct) / 100;
   const cartTotalWithGst = totalAmount + cartCgstAmount + cartSgstAmount;
   const cartHasGst = cartCgstPct > 0 || cartSgstPct > 0;
 
@@ -634,6 +752,7 @@ export default function OrderKioskSplit() {
           isNew: false,
           isModified: false,
           originalQuantity: oi.quantity,
+          isParcel: Boolean(oi.is_parcel),
         });
       }
       setUnifiedCart(cartItems);
@@ -808,6 +927,7 @@ export default function OrderKioskSplit() {
             quantity: cartItem.quantity,
             unit_price: cartItem.unitPrice,
             status: 'pending',
+            is_parcel: cartItem.isParcel ? 1 : 0,
           });
         }
         
@@ -888,6 +1008,7 @@ export default function OrderKioskSplit() {
               quantity: cartItem.quantity,
               unit_price: cartItem.unitPrice,
               status: 'pending',
+              is_parcel: cartItem.isParcel ? 1 : 0,
             });
             
             newlyInsertedItemIds.add(newItemId); // Track this newly inserted item
@@ -913,6 +1034,7 @@ export default function OrderKioskSplit() {
               ...item,
               quantity: cartItem.quantity,
               unit_price: cartItem.unitPrice,
+              is_parcel: cartItem.isParcel ? 1 : 0,
               updated_at: new Date().toISOString()
             });
           }
@@ -1080,6 +1202,8 @@ export default function OrderKioskSplit() {
           quantity: item.quantity,
           unit_price: item.unitPrice,
           status: 'pending',
+          is_parcel: item.isParcel ? 1 : 0,
+          is_gst_exempt: item.menuItem.is_gst_exempt ? 1 : 0,
           menu_item: { name: item.menuItem.name }
         }));
       } else {
@@ -1097,6 +1221,8 @@ export default function OrderKioskSplit() {
                 quantity: oi.quantity,
                 unit_price: oi.unit_price,
                 status: oi.status,
+                is_parcel: oi.is_parcel,
+                is_gst_exempt: mi?.is_gst_exempt ? 1 : 0,
                 menu_item: mi ? { name: mi.name } : undefined
               });
             }
@@ -1118,11 +1244,13 @@ export default function OrderKioskSplit() {
           table_number: table.table_number, 
           floor: { name: currentFloor?.name || 'Unknown Floor' } 
         },
-        order_items: allItems.map(item => ({ 
-          id: item.id, 
-          menu_item: item.menu_item, 
-          quantity: item.quantity, 
-          unit_price: item.unit_price 
+        order_items: allItems.map(item => ({
+          id: item.id,
+          menu_item: item.menu_item,
+          quantity: item.quantity,
+          unit_price: item.unit_price,
+          is_parcel: item.is_parcel,
+          is_gst_exempt: item.is_gst_exempt,
         }))
       };
       
@@ -1130,6 +1258,169 @@ export default function OrderKioskSplit() {
       setShowBillDialog(true);
     } catch (err: any) {
       toast.error(err.message || 'Failed to open billing');
+    }
+  };
+
+  // Print a summary of the CURRENT cart (all items, no prices) — works even
+  // before the order is saved, so staff can hand the kitchen/customer a list
+  // without first sending the KOT. Parcel items are labelled just like the bill.
+  const printCartSummary = async () => {
+    if (unifiedCart.length === 0) {
+      toast.info('Cart is empty');
+      return;
+    }
+    const grouped = groupOrderItemsForBill(
+      unifiedCart.map(i => ({
+        menu_item: { name: i.menuItem.name },
+        quantity: i.quantity,
+        unit_price: i.unitPrice,
+        is_parcel: i.isParcel ? 1 : 0,
+      }))
+    );
+    const floorName = floors.find(f => f.tables.some(t => t.id === selectedTable?.id))?.name;
+    try {
+      const method = await printSummaryAuto({
+        restaurantName: currentRestaurant?.name || '',
+        restaurantAddress: (currentRestaurant as any)?.address,
+        restaurantPhone: (currentRestaurant as any)?.phone,
+        tableNumber: selectedTable?.table_number,
+        floorName,
+        title: 'ORDER SUMMARY',
+        items: grouped.map(g => ({ name: g.name, quantity: g.quantity })),
+      });
+      toast.success(method === 'browser' ? 'Summary opened in print dialog' : 'Summary printed');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to print summary');
+    }
+  };
+
+  // Print a KOT containing ONLY the parcel/takeaway items (no prices), under a
+  // bold "PARCEL / TAKEAWAY" heading, so the kitchen knows which items to pack.
+  // Dine items and the normal bill flow are untouched. Auto-selects the printer.
+  const printParcelKOT = async () => {
+    const parcelLines = unifiedCart.filter(i => i.isParcel);
+    if (parcelLines.length === 0) {
+      toast.info('No parcel items to print');
+      return;
+    }
+    // Group by dish name and sum quantities for a clean ticket.
+    const grouped = new Map<string, number>();
+    for (const line of parcelLines) {
+      grouped.set(line.menuItem.name, (grouped.get(line.menuItem.name) || 0) + line.quantity);
+    }
+    const floorName = floors.find(f => f.tables.some(t => t.id === selectedTable?.id))?.name;
+    try {
+      const method = await printSummaryAuto({
+        restaurantName: currentRestaurant?.name || '',
+        restaurantAddress: (currentRestaurant as any)?.address,
+        restaurantPhone: (currentRestaurant as any)?.phone,
+        tableNumber: selectedTable?.table_number,
+        floorName,
+        title: 'PARCEL / TAKEAWAY',
+        items: Array.from(grouped.entries()).map(([name, quantity]) => ({ name, quantity })),
+      });
+      toast.success(method === 'browser' ? 'Parcel KOT opened in print dialog' : 'Parcel KOT printed');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to print parcel KOT');
+    }
+  };
+
+  // Ctrl+P "quick print": save any pending cart edits, reserve/reuse the bill
+  // number, and print the full priced bill immediately — skipping the Billing
+  // dialog entirely. For a cashier who already knows which printer to use, this
+  // removes the extra "open dialog → click print" round trip. Reads items back
+  // from the DB (rather than component state) so the printed bill always
+  // matches what was actually saved, even right after a submit.
+  const quickPrintBill = async () => {
+    if (!selectedTable || !currentRestaurant) return;
+    if (quickPrintingRef.current) return; // ignore a rapid second Ctrl+P
+    quickPrintingRef.current = true;
+    try {
+      if (unifiedCart.some(item => item.isNew || item.isModified)) {
+        await submitOrder();
+      }
+
+      const { localQuery } = await import('@/services/localDataService');
+      const ordersRes = await localQuery('orders');
+      const orders = (ordersRes.data || []).filter((o: any) =>
+        o.table_id === selectedTable.id && ['pending', 'cooking', 'ready'].includes(o.status)
+      );
+      if (orders.length === 0) {
+        toast.error('No active order to print');
+        return;
+      }
+      const mainOrder = orders[0];
+
+      let subtotal = 0;
+      let taxableSubtotal = 0;
+      const rawItems: { menu_item?: { name: string }; quantity: number; unit_price: number; is_parcel?: number }[] = [];
+      for (const order of orders) {
+        subtotal += order.total_amount || 0;
+        const itemsRes = await localQuery('order_items', { order_id: order.id });
+        for (const oi of (itemsRes.data || [])) {
+          if (['served', 'cancelled'].includes(oi.status)) continue;
+          const mi = menuItems.find(m => m.id === oi.menu_item_id);
+          if (!(mi && mi.is_gst_exempt)) taxableSubtotal += oi.quantity * oi.unit_price;
+          rawItems.push({
+            menu_item: mi ? { name: mi.name } : undefined,
+            quantity: oi.quantity,
+            unit_price: oi.unit_price,
+            is_parcel: oi.is_parcel,
+          });
+        }
+      }
+
+      // Reserve the bill number on first print only; reuse it on any reprint.
+      const db = getDataClient();
+      let billNumber: number | undefined = mainOrder.bill_number ?? undefined;
+      if (!billNumber) {
+        billNumber = await getNextBillNumber();
+        const patch: Record<string, any> = { id: mainOrder.id, bill_number: billNumber };
+        if (currentRestaurant?.id) patch.restaurant_id = currentRestaurant.id;
+        await db.upsert('orders', patch);
+      }
+
+      const cgstPct = (currentRestaurant as any)?.cgst_percentage || 0;
+      const sgstPct = (currentRestaurant as any)?.sgst_percentage || 0;
+      // GST only on the non-exempt (taxable) portion of the bill.
+      const cgstAmt = (taxableSubtotal * cgstPct) / 100;
+      const sgstAmt = (taxableSubtotal * sgstPct) / 100;
+      const grandTotal = Math.round(subtotal + cgstAmt + sgstAmt);
+      const floorName = floors.find(f => f.tables.some(t => t.id === selectedTable.id))?.name;
+
+      const billData = {
+        restaurantName: currentRestaurant?.name || '',
+        restaurantAddress: (currentRestaurant as any)?.address,
+        restaurantPhone: (currentRestaurant as any)?.phone,
+        restaurantGstin: (currentRestaurant as any)?.gstin,
+        tableNumber: selectedTable.table_number,
+        floorName,
+        orderId: mainOrder.id,
+        billNumber,
+        showQrCode: (currentRestaurant as any)?.print_qr_on_bill !== false,
+        paymentQrContent: (currentRestaurant as any)?.payment_qr_content,
+        items: groupOrderItemsForBill(rawItems).map(i => ({ name: i.name, quantity: i.quantity, price: i.unit_price })),
+        subtotal,
+        discountAmount: 0,
+        cgstPercentage: cgstPct,
+        sgstPercentage: sgstPct,
+        cgstAmount: cgstAmt,
+        sgstAmount: sgstAmt,
+        total: grandTotal,
+      };
+
+      const method = await printBillAuto(billData);
+      setCurrentBillNumber(billNumber);
+      toast.success(
+        method === 'browser'
+          ? 'Bill opened in print dialog'
+          : `Bill #${String(billNumber).padStart(3, '0')} printed`
+      );
+      fetchData(); // Refresh the grid so this table shows green (printed) immediately.
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to print bill');
+    } finally {
+      quickPrintingRef.current = false;
     }
   };
 
@@ -1156,13 +1447,26 @@ export default function OrderKioskSplit() {
       // (Ctrl+K is reserved for global "jump to Order Kiosk"; use "/" to focus
       // the menu search here.)
 
-      // Ctrl+T or Cmd+T: Focus table search
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') {
-        console.log('[OrderKiosk Shortcut] Ctrl+T - focusing table search');
+      // Ctrl+A or Cmd+A: Focus table search — but only outside a text field, so
+      // the browser's native "select all text" still works while typing/editing
+      // (e.g. in the quantity box or a search field).
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !isInputField) {
+        console.log('[OrderKiosk Shortcut] Ctrl+A - focusing table search');
         e.preventDefault();
         e.stopPropagation();
         tableSearchRef.current?.focus();
         tableSearchRef.current?.select();
+        return;
+      }
+
+      // Ctrl+P or Cmd+P: Quick-print the bill immediately (saves any pending
+      // cart edits first) instead of opening the Billing dialog — for when the
+      // cashier already knows the printer and just wants it printed now.
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') {
+        console.log('[OrderKiosk Shortcut] Ctrl+P - quick print bill');
+        e.preventDefault();
+        e.stopPropagation();
+        quickPrintBill();
         return;
       }
 
@@ -1176,11 +1480,23 @@ export default function OrderKioskSplit() {
         return;
       }
 
-      // / : Focus menu search (only if not in input field)
-      if (e.key === '/' && !isInputField) {
-        e.preventDefault();
-        menuSearchRef.current?.focus();
-        return;
+      // "/" toggles the menu search focus: press it to jump INTO the search, and
+      // press it again while typing to jump back OUT (so number/+/- shortcuts work
+      // again) — no need to reach for Esc. The typed query is kept on exit.
+      if (e.key === '/') {
+        if (target === menuSearchRef.current) {
+          // Already in the menu search → exit focus back to the page.
+          e.preventDefault();
+          menuSearchRef.current?.blur();
+          kioskRootRef.current?.focus({ preventScroll: true });
+          return;
+        }
+        if (!isInputField) {
+          // Elsewhere on the page → focus the menu search.
+          e.preventDefault();
+          menuSearchRef.current?.focus();
+          return;
+        }
       }
       
       // Escape: Clear search or deselect table
@@ -1247,7 +1563,7 @@ export default function OrderKioskSplit() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [unifiedCart, selectedTable, submitOrder, menuItems, addToCart, updateQuantity, singleMenuItem, searchQuery, tableSearchQuery, billNumberSearch]);
+  }, [unifiedCart, selectedTable, submitOrder, menuItems, addToCart, updateQuantity, singleMenuItem, searchQuery, tableSearchQuery, billNumberSearch, quickPrintBill]);
 
   // ============================================================================
   // FILTERED MENU ITEMS
@@ -1330,7 +1646,7 @@ export default function OrderKioskSplit() {
             <div className="p-4 border-b space-y-2">
               <Input
                 ref={tableSearchRef}
-                placeholder="Search tables, press Enter to select... (Ctrl+T)"
+                placeholder="Search tables, press Enter to select... (Ctrl+A)"
                 value={tableSearchQuery}
                 onChange={(e) => {
                   setTableSearchQuery(e.target.value);
@@ -1381,15 +1697,19 @@ export default function OrderKioskSplit() {
                                 selectedTable?.id === table.id
                                   ? 'border-primary bg-primary/10'
                                   : table.is_occupied && printedTableIds[table.id]
-                                  ? 'border-success bg-success/10 hover:border-success/50'
+                                  ? 'border-green-700 bg-green-700/20 hover:border-green-800'
                                   : table.is_occupied
                                   ? 'border-warning bg-warning/10 hover:border-warning/50'
                                   : 'border-muted bg-muted/50 hover:border-primary/50'
-                              }`}
+                              }${isTableOverTime(table.id) ? ' ring-2 ring-destructive animate-pulse' : ''}`}
                             >
                               {/* Status indicator dot: red = occupied unbilled, green = printed or free */}
                               <div className={`absolute top-1 right-1 w-2 h-2 rounded-full ${
-                                table.is_occupied && !printedTableIds[table.id] ? 'bg-destructive' : 'bg-success'
+                                table.is_occupied && !printedTableIds[table.id]
+                                  ? 'bg-destructive'
+                                  : table.is_occupied && printedTableIds[table.id]
+                                  ? 'bg-green-700'
+                                  : 'bg-success'
                               }`} />
 
                               <div className="font-semibold text-sm leading-tight">{table.table_number}</div>
@@ -1448,7 +1768,7 @@ export default function OrderKioskSplit() {
               <div className="relative">
                 <Input
                   ref={menuSearchRef}
-                  placeholder="Search menu or type shortcut #... (press /)"
+                  placeholder="Search menu or type shortcut #... (/ to focus & exit)"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
@@ -1566,7 +1886,35 @@ export default function OrderKioskSplit() {
                         <FoodTypeIndicator type={item.menuItem.food_type} />
                         <div className="flex-1 min-w-0">
                           <p className="font-medium text-sm truncate">{item.menuItem.name}</p>
-                          <p className="text-xs text-muted-foreground">₹{item.unitPrice} each</p>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-xs text-muted-foreground">₹{item.unitPrice} each</span>
+                            {item.isParcel ? (
+                              <>
+                                <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border bg-amber-100 text-amber-800 border-amber-300">
+                                  <Package className="w-3 h-3" />
+                                  Parcel
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => moveUnit(item.cartItemId, false)}
+                                  title="Move one unit back to dine-in"
+                                  className="text-[10px] px-1.5 py-0.5 rounded border text-muted-foreground border-muted hover:bg-muted"
+                                >
+                                  → Dine
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => moveUnit(item.cartItemId, true)}
+                                title="Move one unit to parcel"
+                                className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border text-muted-foreground border-muted hover:bg-amber-50 hover:text-amber-800 hover:border-amber-300"
+                              >
+                                <Package className="w-3 h-3" />
+                                To Parcel
+                              </button>
+                            )}
+                          </div>
                         </div>
                       </div>
                       
@@ -1664,6 +2012,27 @@ export default function OrderKioskSplit() {
                     </>
                   )}
                 </Button>
+
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    className="flex-1"
+                    onClick={printCartSummary}
+                  >
+                    <FileText className="w-4 h-4 mr-2" />
+                    Print Summary
+                  </Button>
+                  {unifiedCart.some(i => i.isParcel) && (
+                    <Button
+                      variant="outline"
+                      className="flex-1 border-amber-400 text-amber-700 hover:bg-amber-50"
+                      onClick={printParcelKOT}
+                    >
+                      <Package className="w-4 h-4 mr-2" />
+                      Parcel KOT
+                    </Button>
+                  )}
+                </div>
 
                 {currentOrderId && (
                   <Button

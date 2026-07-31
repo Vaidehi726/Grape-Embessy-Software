@@ -36,6 +36,7 @@ interface OrderItem {
   unit_price: number;
   status: OrderStatus;
   notes: string | null;
+  is_parcel?: number | boolean;
   menu_item?: { name: string; food_type: FoodType; preparation_time: number | null };
 }
 
@@ -591,6 +592,11 @@ export default function KitchenView() {
                             <div>
                               <span className="font-medium text-sm">{item.menu_item?.name || 'Unknown'}</span>
                               <span className="text-muted-foreground text-sm ml-2">×{item.quantity}</span>
+                              {Boolean(item.is_parcel) && (
+                                <Badge className="ml-2 bg-amber-500 hover:bg-amber-500 text-white text-[10px] px-1.5 py-0">
+                                  PARCEL
+                                </Badge>
+                              )}
                             </div>
                           </div>
                           <div className="flex items-center gap-2">

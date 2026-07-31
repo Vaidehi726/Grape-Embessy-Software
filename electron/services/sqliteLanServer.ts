@@ -570,6 +570,7 @@ export class SqliteLanServer {
         print_qr_on_bill INTEGER DEFAULT 1,
         payment_qr_content TEXT,
         lock_saved_items INTEGER DEFAULT 0,
+        table_alert_minutes INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
@@ -630,6 +631,7 @@ export class SqliteLanServer {
         image_url TEXT,
         shortcut_code TEXT,
         sort_order INTEGER DEFAULT 0,
+        is_gst_exempt INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
@@ -666,6 +668,7 @@ export class SqliteLanServer {
         total_price REAL NOT NULL,
         special_instructions TEXT,
         status TEXT DEFAULT 'pending',
+        is_parcel INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (order_id) REFERENCES orders(id),

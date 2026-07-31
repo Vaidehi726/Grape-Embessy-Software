@@ -68,6 +68,10 @@ export class LanServerSchemaMigration {
       console.log('[Migration] Adding column to menu_items: sort_order');
       db.exec('ALTER TABLE menu_items ADD COLUMN sort_order INTEGER DEFAULT 0');
     }
+    if (!columns.find(c => c.name === 'is_gst_exempt')) {
+      console.log('[Migration] Adding column to menu_items: is_gst_exempt');
+      db.exec('ALTER TABLE menu_items ADD COLUMN is_gst_exempt INTEGER DEFAULT 0');
+    }
   }
 
   /**
@@ -215,6 +219,12 @@ export class LanServerSchemaMigration {
     // Check if table already has proper structure
     const columns = this.getTableColumns(db, 'order_items');
     
+    // Parcel/takeaway flag — a simple additive column (no table rebuild needed).
+    if (columns.length > 0 && !columns.find(c => c.name === 'is_parcel')) {
+      console.log('[Migration] Adding column to order_items: is_parcel');
+      db.exec('ALTER TABLE order_items ADD COLUMN is_parcel INTEGER DEFAULT 0');
+    }
+
     // Check for missing columns
     const missingColumns: Array<{ name: string; type: string; default?: string }> = [];
 
@@ -285,6 +295,11 @@ export class LanServerSchemaMigration {
     // Check for lock_saved_items column (prevent reducing saved order items)
     if (!columns.find(c => c.name === 'lock_saved_items')) {
       missingColumns.push({ name: 'lock_saved_items', type: 'INTEGER', default: '0' });
+    }
+
+    // Table over-time alert threshold (minutes; 0 = disabled)
+    if (!columns.find(c => c.name === 'table_alert_minutes')) {
+      missingColumns.push({ name: 'table_alert_minutes', type: 'INTEGER', default: '0' });
     }
 
     // Add missing columns

@@ -381,7 +381,9 @@ class USBPrinterService {
     // Title
     add(CMD.ALIGN_CENTER);
     add(CMD.BOLD_ON);
-    text('ORDER SUMMARY'); nl();
+    add(CMD.DOUBLE_WIDTH_ON);
+    text(summary.title || 'ORDER SUMMARY'); nl();
+    add(CMD.DOUBLE_WIDTH_OFF);
     add(CMD.BOLD_OFF);
     text('--------------------------------'); nl();
 

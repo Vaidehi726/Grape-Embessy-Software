@@ -33,6 +33,7 @@ import { getNextBillNumber } from '@/services/dailyBillNumber';
 import { offlineMutate } from '@/services/offlineDataService';
 import { PrinterSelector } from '@/components/PrinterSelector';
 import { toast } from 'sonner';
+import { groupOrderItemsForBill } from '@/services/thermalPrinter';
 import type { BillData, SummaryPrintData } from '@/services/thermalPrinter';
 
 interface OrderItem {
@@ -40,6 +41,8 @@ interface OrderItem {
   menu_item?: { name: string };
   quantity: number;
   unit_price: number;
+  is_parcel?: number | boolean;
+  is_gst_exempt?: number | boolean;
 }
 
 interface BillingOrder {
@@ -99,6 +102,12 @@ export function BillingDialog({
 
   // ── Bill math (discount applied to subtotal, GST charged on the net) ──────
   const subtotalAmount = order?.total_amount ?? 0;
+  // Portion of the subtotal that is NOT GST-exempt. GST is charged only on this.
+  // Exempt items still count toward subtotal/total, just not toward the tax.
+  const taxableSubtotal = (order?.order_items || []).reduce(
+    (sum, it) => sum + (Boolean((it as any).is_gst_exempt) ? 0 : it.unit_price * it.quantity),
+    0
+  );
   const discountAmount = (() => {
     const v = parseFloat(discountInput);
     if (!v || v <= 0) return 0;
@@ -107,8 +116,12 @@ export function BillingDialog({
     return Math.min(Math.max(raw, 0), subtotalAmount);
   })();
   const netSubtotal = Math.max(subtotalAmount - discountAmount, 0);
-  const cgstAmount = (netSubtotal * restaurantCgstPercentage) / 100;
-  const sgstAmount = (netSubtotal * restaurantSgstPercentage) / 100;
+  // Discount is spread across the whole bill; GST applies to the taxable share of
+  // the net. When nothing is exempt, taxableRatio = 1 → identical to before.
+  const taxableRatio = subtotalAmount > 0 ? Math.min(taxableSubtotal / subtotalAmount, 1) : 0;
+  const taxableNet = netSubtotal * taxableRatio;
+  const cgstAmount = (taxableNet * restaurantCgstPercentage) / 100;
+  const sgstAmount = (taxableNet * restaurantSgstPercentage) / 100;
   // Bills are settled in whole rupees — round the payable so there is never a
   // fractional amount charged, stored, or printed.
   const grandTotal = Math.round(netSubtotal + cgstAmount + sgstAmount);
@@ -144,7 +157,8 @@ export function BillingDialog({
   const [assignedBillNumber, setAssignedBillNumber] = useState<number | null>(
     (order as any)?.bill_number ?? null
   );
-  const billNumberInFlight = useRef(false);
+  // Holds the in-flight reservation so concurrent callers share ONE number.
+  const billNumberPromiseRef = useRef<Promise<number | undefined> | null>(null);
 
   // Re-sync the local view whenever a different order is opened in the dialog.
   useEffect(() => {
@@ -154,65 +168,70 @@ export function BillingDialog({
   const effectiveBillNumber: number | null = (order as any)?.bill_number ?? assignedBillNumber;
 
   // Reserve + persist a bill number the first time this order is printed; reused
-  // on every reprint. Guarded so a double-click can't reserve two numbers.
+  // on every reprint.
+  //
+  // Race fix: a fast double-print (double-click, or Enter + button firing almost
+  // together) used to make the SECOND caller hit an "in-flight" flag and return
+  // undefined — so that receipt printed with NO bill number, while a reprint a
+  // few seconds later showed it. Now concurrent callers all AWAIT the same
+  // reservation promise and every one receives the same real number.
   const ensureBillNumber = async (): Promise<number | undefined> => {
     if (!order) return undefined;
     const existing = (order as any).bill_number ?? assignedBillNumber;
     if (existing) return existing;
-    if (billNumberInFlight.current) return undefined;
-    billNumberInFlight.current = true;
-    try {
-      const n = await getNextBillNumber();
-      setAssignedBillNumber(n);
+    if (billNumberPromiseRef.current) return billNumberPromiseRef.current;
+
+    billNumberPromiseRef.current = (async () => {
       try {
-        // restaurant_id is included because the LAN server validates every order
-        // upsert and requires it; without it the write is rejected on client PCs.
-        const patch: Record<string, any> = { id: order.id, bill_number: n };
-        const rid = restaurantId ?? (order as any).restaurant_id;
-        if (rid) patch.restaurant_id = rid;
-        await offlineMutate('orders', patch);
-      } catch (e) {
-        console.warn('[BillingDialog] Failed to persist bill number:', e);
+        const n = await getNextBillNumber();
+        setAssignedBillNumber(n);
+        try {
+          // restaurant_id is included because the LAN server validates every order
+          // upsert and requires it; without it the write is rejected on client PCs.
+          const patch: Record<string, any> = { id: order.id, bill_number: n };
+          const rid = restaurantId ?? (order as any).restaurant_id;
+          if (rid) patch.restaurant_id = rid;
+          await offlineMutate('orders', patch);
+        } catch (e) {
+          console.warn('[BillingDialog] Failed to persist bill number:', e);
+        }
+        return n;
+      } finally {
+        // Clear so a later reprint of a DIFFERENT order can reserve again; the
+        // `existing` guard above stops this order from re-reserving.
+        billNumberPromiseRef.current = null;
       }
-      return n;
-    } finally {
-      billNumberInFlight.current = false;
-    }
+    })();
+
+    return billNumberPromiseRef.current;
   };
 
-  // Group order items by menu item name for display/printing
-  const groupOrderItems = (items: OrderItem[]) => {
-    const grouped = new Map<string, { name: string; quantity: number; unit_price: number; total: number }>();
-    
-    items.forEach(item => {
-      const name = item.menu_item?.name || 'Item';
-      if (grouped.has(name)) {
-        const existing = grouped.get(name)!;
-        existing.quantity += item.quantity;
-        existing.total += item.unit_price * item.quantity;
-      } else {
-        grouped.set(name, {
-          name,
-          quantity: item.quantity,
-          unit_price: item.unit_price,
-          total: item.unit_price * item.quantity,
-        });
-      }
-    });
-    
-    return Array.from(grouped.values());
-  };
+  // Group order items by menu item name for display/printing (shared with the
+  // Ctrl+P quick-print path so both formats stay identical).
+  const groupOrderItems = groupOrderItemsForBill;
 
-  // Auto-refresh device list when dialog opens in Electron
+  // Printer discovery is done ONCE, in the background, and cached — never on
+  // every dialog open. Both scans block the main process (USB enumeration opens
+  // every USB device; the Windows-printer list spawns PowerShell Get-Printer
+  // ~1s), so the old "scan on every open, clear on every close" made the dialog
+  // freeze each time it opened. Pre-warming the Windows list on mount means it's
+  // already there by the time the dialog opens → instant.
   useEffect(() => {
-    if (open && isElectronApp) {
-      setLoadingDevices(true);
-      refreshDevices().finally(() => setLoadingDevices(false));
-      
-      // Also fetch Windows printers
+    if (isElectronApp && windowsPrinters.length === 0) {
       fetchWindowsPrinters();
     }
-  }, [open, isElectronApp, refreshDevices]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isElectronApp]);
+
+  // Scan USB devices only when the user actually opens the device picker — the
+  // dialog itself never triggers a USB enumeration.
+  useEffect(() => {
+    if (showDeviceList && isElectronApp && availableDevices.length === 0) {
+      setLoadingDevices(true);
+      refreshDevices().finally(() => setLoadingDevices(false));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showDeviceList]);
 
   const getBillData = (billNumberOverride?: number): BillData | null => {
     if (!order) return null;
@@ -514,10 +533,10 @@ export function BillingDialog({
       setCustomerGstin('');
       setDiscountInput('');
       setDiscountType('percent');
-      // Clear printer selection when dialog closes
+      // NOTE: intentionally do NOT clear windowsPrinters / selectedWindowsPrinter
+      // here — keeping them cached is what makes the NEXT dialog open instant
+      // (no re-scan). matchingPrinters is VID/PID-specific, safe to reset.
       setMatchingPrinters([]);
-      setWindowsPrinters([]);
-      setSelectedWindowsPrinter('');
     }
   };
 

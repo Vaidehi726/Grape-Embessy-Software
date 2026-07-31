@@ -44,6 +44,7 @@ const TABLES_SCHEMA = `
     unit_price REAL NOT NULL,
     notes TEXT,
     status TEXT DEFAULT 'pending',
+    is_parcel INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     sync_status TEXT DEFAULT 'pending_sync',
@@ -76,6 +77,7 @@ const TABLES_SCHEMA = `
     image_url TEXT,
     shortcut_code TEXT,
     sort_order INTEGER DEFAULT 0,
+    is_gst_exempt INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     sync_status TEXT DEFAULT 'synced'
@@ -128,6 +130,7 @@ const TABLES_SCHEMA = `
     print_qr_on_bill INTEGER DEFAULT 1,
     payment_qr_content TEXT,
     lock_saved_items INTEGER DEFAULT 0,
+    table_alert_minutes INTEGER DEFAULT 0,
     owner_id TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
@@ -324,6 +327,30 @@ export class LocalDatabase {
           console.log(`[LocalDB] Schema migration: ${t} adding sync_status`);
           this.db.exec(`ALTER TABLE ${t} ADD COLUMN sync_status TEXT DEFAULT ${def}`);
         }
+      }
+
+      // Parcel/takeaway flag on order_items (dine-in items on a running table can
+      // also carry parcel items in the SAME order; is_parcel=1 marks those). Older
+      // DBs predate the column — add it so inserts including is_parcel don't throw.
+      const oiCols = this.db.prepare("PRAGMA table_info('order_items')").all() as any[];
+      if (oiCols.length > 0 && !oiCols.some((c: any) => c.name === 'is_parcel')) {
+        console.log('[LocalDB] Schema migration: order_items adding is_parcel');
+        this.db.exec('ALTER TABLE order_items ADD COLUMN is_parcel INTEGER DEFAULT 0');
+      }
+
+      // Per-item GST exemption: menu items flagged here are excluded from the GST
+      // base at billing time. Default 0 → every existing item is taxed as before.
+      const miCols = this.db.prepare("PRAGMA table_info('menu_items')").all() as any[];
+      if (miCols.length > 0 && !miCols.some((c: any) => c.name === 'is_gst_exempt')) {
+        console.log('[LocalDB] Schema migration: menu_items adding is_gst_exempt');
+        this.db.exec('ALTER TABLE menu_items ADD COLUMN is_gst_exempt INTEGER DEFAULT 0');
+      }
+
+      // Table over-time alert threshold (minutes; 0 = disabled), set on the server.
+      const rCols = this.db.prepare("PRAGMA table_info('restaurants')").all() as any[];
+      if (rCols.length > 0 && !rCols.some((c: any) => c.name === 'table_alert_minutes')) {
+        console.log('[LocalDB] Schema migration: restaurants adding table_alert_minutes');
+        this.db.exec('ALTER TABLE restaurants ADD COLUMN table_alert_minutes INTEGER DEFAULT 0');
       }
     } catch (e) {
       // First run, tables don't exist yet
