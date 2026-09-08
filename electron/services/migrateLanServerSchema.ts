@@ -72,6 +72,10 @@ export class LanServerSchemaMigration {
       console.log('[Migration] Adding column to menu_items: is_gst_exempt');
       db.exec('ALTER TABLE menu_items ADD COLUMN is_gst_exempt INTEGER DEFAULT 0');
     }
+    if (!columns.find(c => c.name === 'is_open_item')) {
+      console.log('[Migration] Adding column to menu_items: is_open_item');
+      db.exec('ALTER TABLE menu_items ADD COLUMN is_open_item INTEGER DEFAULT 0');
+    }
   }
 
   /**
@@ -223,6 +227,12 @@ export class LanServerSchemaMigration {
     if (columns.length > 0 && !columns.find(c => c.name === 'is_parcel')) {
       console.log('[Migration] Adding column to order_items: is_parcel');
       db.exec('ALTER TABLE order_items ADD COLUMN is_parcel INTEGER DEFAULT 0');
+    }
+
+    // GST-exempt snapshot (nullable → NULL means fall back to the menu item).
+    if (columns.length > 0 && !columns.find(c => c.name === 'is_gst_exempt')) {
+      console.log('[Migration] Adding column to order_items: is_gst_exempt');
+      db.exec('ALTER TABLE order_items ADD COLUMN is_gst_exempt INTEGER');
     }
 
     // Check for missing columns

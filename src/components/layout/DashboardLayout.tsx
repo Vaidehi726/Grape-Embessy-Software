@@ -58,11 +58,11 @@ interface NavItem {
 
 const getNavItems = (slug: string): NavItem[] => [
   { href: `/dashboard/${slug}`, label: 'Dashboard', icon: LayoutDashboard },
-  { href: `/dashboard/${slug}/order-kiosk`, label: 'Order Kiosk', icon: Monitor, roles: ['owner', 'manager', 'waiter'] },
+  { href: `/dashboard/${slug}/order-kiosk`, label: 'Order KOT', icon: Monitor, roles: ['owner', 'manager', 'waiter'] },
   { href: `/dashboard/${slug}/kitchens`, label: 'Kitchens', icon: ChefHat, roles: ['owner', 'manager'] },
   { href: `/dashboard/${slug}/floors`, label: 'Floors & Tables', icon: Layers, roles: ['owner', 'manager'] },
   { href: `/dashboard/${slug}/menu`, label: 'Menu', icon: BookOpen, roles: ['owner', 'manager'] },
-  { href: `/dashboard/${slug}/orders`, label: 'Orders', icon: ShoppingBag },
+  { href: `/dashboard/${slug}/orders`, label: 'Tables', icon: ShoppingBag },
   { href: `/dashboard/${slug}/reports`, label: 'Reports', icon: BarChart3, roles: ['owner', 'manager'] },
   { href: `/dashboard/${slug}/expenses`, label: 'Expenses', icon: Wallet, roles: ['owner', 'manager'] },
   { href: `/dashboard/${slug}/staff`, label: 'Staff', icon: Users, roles: ['owner', 'manager'] },
@@ -251,7 +251,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
             {navItems.map((item) => {
               const isActive = location.pathname === item.href || 
                 (item.label === 'Dashboard' && location.pathname === `/dashboard/${currentRestaurant?.slug}`);
-              const showBadge = item.label === 'Orders' && activeOrderCount > 0;
+              const showBadge = item.label === 'Tables' && activeOrderCount > 0;
               return (
                 <Link
                   key={item.href}

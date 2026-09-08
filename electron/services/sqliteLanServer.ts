@@ -135,7 +135,12 @@ export class SqliteLanServer {
         // rest untouched. INSERT OR REPLACE would delete+reinsert the row, so a
         // partial update like { id, is_occupied } from a client would blank
         // floor_id/table_number — making the table vanish from the kiosk.
-        const updateClause = columns.filter(c => c !== 'id').map(c => `${c} = excluded.${c}`).join(', ');
+        //
+        // created_at is never updated: it is set once when the row is created.
+        // Clients send a "now" created_at on partial patches that omit it, which
+        // would otherwise reset an order's creation time on every bill print or
+        // payment (see the matching note in localDb.upsert).
+        const updateClause = columns.filter(c => c !== 'id' && c !== 'created_at').map(c => `${c} = excluded.${c}`).join(', ');
         const sql = updateClause
           ? `INSERT INTO ${table} (${columns.join(',')}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updateClause}`
           : `INSERT INTO ${table} (${columns.join(',')}) VALUES (${placeholders}) ON CONFLICT(id) DO NOTHING`;
@@ -234,7 +239,8 @@ export class SqliteLanServer {
             const placeholders = columns.map(() => '?').join(',');
             const values = Object.values(data);
 
-            const updateClause = columns.filter(c => c !== 'id').map(c => `${c} = excluded.${c}`).join(', ');
+            // created_at excluded from UPDATE — immutable once the row exists.
+            const updateClause = columns.filter(c => c !== 'id' && c !== 'created_at').map(c => `${c} = excluded.${c}`).join(', ');
             const sql = updateClause
               ? `INSERT INTO ${table} (${columns.join(',')}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updateClause}`
               : `INSERT INTO ${table} (${columns.join(',')}) VALUES (${placeholders}) ON CONFLICT(id) DO NOTHING`;
@@ -632,6 +638,8 @@ export class SqliteLanServer {
         shortcut_code TEXT,
         sort_order INTEGER DEFAULT 0,
         is_gst_exempt INTEGER DEFAULT 0,
+        -- 1 = one-off "open item" line (see the note in localDb.ts).
+        is_open_item INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
@@ -669,6 +677,9 @@ export class SqliteLanServer {
         special_instructions TEXT,
         status TEXT DEFAULT 'pending',
         is_parcel INTEGER DEFAULT 0,
+        -- Snapshot of the menu item's GST-exempt flag when ordered (NULL = not
+        -- recorded → callers fall back to the menu item's current flag).
+        is_gst_exempt INTEGER,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (order_id) REFERENCES orders(id),

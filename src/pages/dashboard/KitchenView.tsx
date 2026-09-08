@@ -151,8 +151,17 @@ export default function KitchenView() {
           let orderItems: any[] = [];
           if (db) {
             const itemsRes = await db.query('order_items', { order_id: order.id });
+            // Show items in the order they were added. The local SQLite query
+            // returns `ORDER BY updated_at DESC` (newest first, and an edited
+            // item jumps to the top), which listed the kitchen ticket upside
+            // down; sorting by created_at matches the printed KOT.
+            const ordered = (itemsRes.data || []).slice().sort((a: any, b: any) =>
+              String(a?.created_at ?? '').replace(' ', 'T')
+                .localeCompare(String(b?.created_at ?? '').replace(' ', 'T')) ||
+              String(a?.id ?? '').localeCompare(String(b?.id ?? ''))
+            );
             // Join with menu_items to get the name and food_type
-            orderItems = (itemsRes.data || []).map((item: any) => {
+            orderItems = ordered.map((item: any) => {
               const menuItem = localMenuItems.find((m: any) => m.id === item.menu_item_id);
               return {
                 ...item,

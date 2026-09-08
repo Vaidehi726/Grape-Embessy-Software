@@ -1,6 +1,7 @@
 // WebUSB ESC/POS Thermal Printer Service
 // Supports: Epson M325A, TVS RP3210, Epson TM-T82, POS80, and other ESC/POS compatible USB printers
 
+import { formatBillDate } from './thermalPrinter';
 import type { BillData, SummaryPrintData } from './thermalPrinter';
 
 // ESC/POS Command Constants
@@ -260,7 +261,8 @@ class USBPrinterService {
 
     // Table & Date
     add(CMD.ALIGN_LEFT);
-    const billDate = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    // Order's own date when provided, so reprints keep the original bill date.
+    const billDate = formatBillDate(bill.billDate);
     text(`Table: ${bill.tableNumber || 'Takeaway'}`); nl();
     text(`Date: ${billDate}`); nl();
     

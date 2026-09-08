@@ -747,8 +747,19 @@ export default function Reports() {
     const sub = Number(order.total_amount) || 0;
     const disc = Number(order.discount_amount) || 0;
     const net = Math.max(sub - disc, 0);
-    const cgst = (net * (currentRestaurant?.cgst_percentage || 0)) / 100;
-    const sgst = (net * (currentRestaurant?.sgst_percentage || 0)) / 100;
+    // GST applies only to the non-exempt share of the bill, mirroring how the
+    // Billing dialog computes it (discount spread across the whole bill).
+    const items = order.order_items || [];
+    const taxableSub = items.length
+      ? items.reduce(
+          (s: number, it: any) => s + (Boolean(it.is_gst_exempt) ? 0 : Number(it.unit_price) * it.quantity),
+          0
+        )
+      : sub;
+    const taxableRatio = sub > 0 ? Math.min(taxableSub / sub, 1) : 0;
+    const taxableNet = net * taxableRatio;
+    const cgst = (taxableNet * (currentRestaurant?.cgst_percentage || 0)) / 100;
+    const sgst = (taxableNet * (currentRestaurant?.sgst_percentage || 0)) / 100;
     return net + cgst + sgst;
   };
 
@@ -854,6 +865,12 @@ export default function Reports() {
                 const menuItem = allMenuItems.find((m: any) => m.id === item.menu_item_id);
                 return {
                   ...item,
+                  // Resolve GST exemption for reprints/re-billing: prefer the
+                  // snapshot stored on the order item; fall back to the menu
+                  // item's current flag for rows saved before the snapshot
+                  // existed. Without this the Billing dialog saw `undefined`
+                  // and charged GST on exempt items when reprinting later.
+                  is_gst_exempt: item.is_gst_exempt ?? (menuItem?.is_gst_exempt ? 1 : 0),
                   menu_item: menuItem ? {
                     name: menuItem.name,
                     food_type: menuItem.food_type
@@ -995,11 +1012,21 @@ export default function Reports() {
     const totalRevenue = completed.reduce((sum, o) => sum + Number(o.total_amount), 0);
     const avgOrderValue = completed.length > 0 ? totalRevenue / completed.length : 0;
 
-    // GST totals derived from restaurant settings
+    // GST totals derived from restaurant settings. Only the NON-exempt portion of
+    // revenue is taxed — summing exempt items into the base would overstate GST
+    // on the sales report (the bills themselves already exclude them).
     const cgstPct = currentRestaurant?.cgst_percentage ?? 0;
     const sgstPct = currentRestaurant?.sgst_percentage ?? 0;
-    const cgstTotal = (totalRevenue * cgstPct) / 100;
-    const sgstTotal = (totalRevenue * sgstPct) / 100;
+    const taxableRevenue = completed.reduce((sum, o) => {
+      const items = o.order_items || [];
+      if (items.length === 0) return sum + Number(o.total_amount); // no item detail → assume taxable
+      return sum + items.reduce(
+        (s, it) => s + (Boolean((it as any).is_gst_exempt) ? 0 : Number(it.unit_price) * it.quantity),
+        0
+      );
+    }, 0);
+    const cgstTotal = (taxableRevenue * cgstPct) / 100;
+    const sgstTotal = (taxableRevenue * sgstPct) / 100;
     const grandTotal = totalRevenue + cgstTotal + sgstTotal;
     
     // Payment method breakdown

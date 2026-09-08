@@ -228,23 +228,40 @@ export default function Orders() {
         let localTables: any[] = [];
         let localFloors: any[] = [];
         
-        const [menuResult, tablesResult, floorsResult] = await Promise.all([
+        // Fetch order_items ONCE for all orders instead of once per order. The old
+        // code awaited a separate query inside the loop (an N+1): with N orders it
+        // made N sequential round-trips — and on a LAN client each one is an HTTP
+        // request — which is why this page took seconds to open. One query plus an
+        // in-memory group is effectively instant.
+        const [menuResult, tablesResult, floorsResult, allItemsResult] = await Promise.all([
           localQuery('menu_items'),
           localQuery('tables'),
-          localQuery('floors')
+          localQuery('floors'),
+          localQuery('order_items')
         ]);
         localMenuItems = menuResult.data || [];
         localTables = tablesResult.data || [];
         localFloors = floorsResult.data || [];
-        
+
+        // Bucket every order_item by its order_id for O(1) lookup below.
+        const itemsByOrderId = new Map<string, any[]>();
+        for (const item of (allItemsResult.data || []) as any[]) {
+          const bucket = itemsByOrderId.get(item.order_id);
+          if (bucket) bucket.push(item);
+          else itemsByOrderId.set(item.order_id, [item]);
+        }
+
         for (const order of rawOrders) {
           let orderItems: any[] = [];
-          const itemsRes = await localQuery('order_items', { order_id: order.id });
           // Join with menu_items to get the name and food_type
-          orderItems = (itemsRes.data || []).map((item: any) => {
+          orderItems = (itemsByOrderId.get(order.id) || []).map((item: any) => {
             const menuItem = localMenuItems.find((m: any) => m.id === item.menu_item_id);
             return {
               ...item,
+              // Prefer the snapshot on the order item; fall back to the menu
+              // item's current flag for rows saved before the snapshot existed.
+              // Without this, billing from this screen taxed exempt items.
+              is_gst_exempt: item.is_gst_exempt ?? (menuItem?.is_gst_exempt ? 1 : 0),
               menu_item: menuItem ? {
                 name: menuItem.name,
                 food_type: menuItem.food_type

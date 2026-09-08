@@ -81,6 +81,7 @@ interface MenuItem {
   kitchen_id: string | null;
   shortcut_code?: string | null;
   is_gst_exempt?: number | boolean | null;
+  is_open_item?: number | boolean | null;
 }
 
 // Unified cart item - simple, no status tracking
@@ -124,6 +125,28 @@ const SpiceLevelIndicator = ({ level }: { level: 'mild' | 'medium' | 'spicy' | '
         <Flame key={i} className="w-3 h-3 text-orange-500 fill-orange-500" />
       ))}
     </div>
+  );
+};
+
+// Put order items back in the order they were ADDED.
+//
+// The data layer doesn't guarantee this: local SQLite returns every query as
+// `ORDER BY updated_at DESC` (newest first — and editing an item's quantity
+// bumps it to the top), while the LAN server returns rows in insertion order.
+// That's why a printed KOT came out upside-down and could reshuffle after an
+// edit. Sorting by created_at here gives the cart, the KOT and the bill one
+// stable top-to-bottom order that matches how the cashier entered the items,
+// identically on the server PC and on every LAN client.
+//
+// created_at is ISO ("2026-07-17T10:00:00.000Z") for rows written by the app,
+// but older rows can carry SQLite's DEFAULT format ("2026-07-17 10:00:00"), so
+// the space is normalised to "T" to keep the two comparable as plain strings.
+const inEntryOrder = <T,>(items: T[]): T[] => {
+  const key = (r: any) => String(r?.created_at ?? '').replace(' ', 'T');
+  return (items || []).slice().sort(
+    (a, b) => key(a).localeCompare(key(b)) ||
+      // Stable tie-break so items saved in the same second never swap around.
+      String((a as any)?.id ?? '').localeCompare(String((b as any)?.id ?? ''))
   );
 };
 
@@ -173,6 +196,13 @@ export default function OrderKioskSplit() {
   // Tables whose current order has already been printed (bill number assigned) →
   // rendered in green on the grid so staff can see at a glance which are billed.
   const [printedTableIds, setPrintedTableIds] = useState<Record<string, boolean>>({});
+  // "Open item" — a one-off line (day's special / off-menu request) typed in
+  // while taking the order. Not part of the permanent menu.
+  const [openItemDialogOpen, setOpenItemDialogOpen] = useState(false);
+  const [openItemName, setOpenItemName] = useState('');
+  const [openItemPrice, setOpenItemPrice] = useState('');
+  const [openItemGstExempt, setOpenItemGstExempt] = useState(false);
+  const [openItemSaving, setOpenItemSaving] = useState(false);
   const [tableSearchQuery, setTableSearchQuery] = useState('');
   const [billNumberSearch, setBillNumberSearch] = useState('');
   const [hasAutoSelected, setHasAutoSelected] = useState(false);
@@ -188,6 +218,11 @@ export default function OrderKioskSplit() {
   const kioskRootRef = useRef<HTMLDivElement>(null);
   // Guards Ctrl+P against a rapid double-fire reserving two bill numbers / double-printing.
   const quickPrintingRef = useRef(false);
+  // Hard re-entrancy lock for submitOrder. The `submitting` STATE can't do this:
+  // React state updates are async, so a second synchronous call (Enter key repeat,
+  // Enter + button, Enter then Ctrl+P) still sees the old value and runs with the
+  // same stale cart — inserting every new item twice.
+  const submitInFlightRef = useRef(false);
   
   const { printBill: printThermal } = useThermalPrinter();
   const { printBill: printUSB } = useUSBPrinter();
@@ -273,7 +308,11 @@ export default function OrderKioskSplit() {
         const itemsRes = await localQuery('menu_items');
         let items = (itemsRes.data || []) as MenuItem[];
         items = items
-          .filter(i => i.is_available && categoryIds.includes(i.category_id))
+          // Open items are kept in this list even though they are hidden from the
+          // grid: the cart, bill, KOT and kitchen view all resolve an order line's
+          // name/price by looking the menu item up here, so leaving them out would
+          // make an ordered open item silently vanish when the table is reopened.
+          .filter(i => i.is_open_item || (i.is_available && categoryIds.includes(i.category_id)))
           .sort((a: any, b: any) =>
             ((a.sort_order ?? 0) - (b.sort_order ?? 0)) ||
             String(a.created_at || '').localeCompare(String(b.created_at || '')) ||
@@ -423,7 +462,7 @@ export default function OrderKioskSplit() {
             quantity: item.quantity
           })));
           
-          for (const orderItem of (itemsRes.data || [])) {
+          for (const orderItem of inEntryOrder(itemsRes.data || [])) {
             if (['served', 'cancelled'].includes(orderItem.status)) {
               console.log('[loadTableOrder] Skipping item (status:', orderItem.status, '):', orderItem.id);
               continue;
@@ -598,6 +637,82 @@ export default function OrderKioskSplit() {
     });
   };
 
+  // Create an "open item" and drop it straight into the cart.
+  //
+  // It is saved as a real menu_items row (flagged is_open_item, is_available=0)
+  // rather than living only in cart state, because every downstream screen —
+  // KOT, bill, kitchen view, reports — resolves an order line's name and price
+  // by looking up its menu item. Persisting it means the line prints and reports
+  // correctly and survives reopening the table, while the flag keeps it out of
+  // the menu grid and the Menu manager so it is never re-ordered or maintained.
+  const addOpenItem = async () => {
+    const name = openItemName.trim();
+    const price = parseFloat(openItemPrice);
+
+    if (name.length < 2) {
+      toast.error('Enter an item name (at least 2 characters)');
+      return;
+    }
+    if (!Number.isFinite(price) || price < 0) {
+      toast.error('Enter a valid price');
+      return;
+    }
+    // menu_items.category_id is required (and a foreign key), so an open item is
+    // parked in the first category. It never shows there — the grid filters
+    // open items out.
+    const categoryId = categories[0]?.id;
+    if (!categoryId) {
+      toast.error('Add at least one menu category before using open items');
+      return;
+    }
+
+    setOpenItemSaving(true);
+    try {
+      const db = getDataClient();
+      const newItem: MenuItem = {
+        id: crypto.randomUUID(),
+        name,
+        description: null,
+        price,
+        food_type: 'veg',
+        spice_level: null,
+        is_available: false,   // never orderable from the grid
+        category_id: categoryId,
+        kitchen_id: null,
+        shortcut_code: null,
+        is_gst_exempt: openItemGstExempt ? 1 : 0,
+        is_open_item: 1,
+      };
+
+      const res = await db.upsert('menu_items', {
+        id: newItem.id,
+        category_id: categoryId,
+        name,
+        price,
+        food_type: 'veg',
+        is_available: 0,
+        is_gst_exempt: openItemGstExempt ? 1 : 0,
+        is_open_item: 1,
+      });
+      if (!res.success) throw new Error(res.error || 'Could not save the open item');
+
+      // Make it resolvable immediately, without waiting for the next poll.
+      setMenuItems(prev => [...prev, newItem]);
+      addToCart(newItem);
+
+      toast.success(`Added ${name}`);
+      setOpenItemDialogOpen(false);
+      setOpenItemName('');
+      setOpenItemPrice('');
+      setOpenItemGstExempt(false);
+      kioskRootRef.current?.focus({ preventScroll: true });
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to add open item');
+    } finally {
+      setOpenItemSaving(false);
+    }
+  };
+
   // Move ONE unit of a cart line between dine-in and parcel. This is what lets a
   // single "Misal x5" be split into e.g. 3 dine-in + 2 parcel: tap "To Parcel"
   // twice on the dine line. The moved unit lands on the same dish's line of the
@@ -739,7 +854,7 @@ export default function OrderKioskSplit() {
 
       const itemsRes = await localQuery('order_items', { order_id: order.id });
       const cartItems: UnifiedCartItem[] = [];
-      for (const oi of (itemsRes.data || [])) {
+      for (const oi of inEntryOrder(itemsRes.data || [])) {
         if (['cancelled', 'void'].includes(oi.status)) continue;
         const menuItem = menuItems.find(m => m.id === oi.menu_item_id);
         if (!menuItem) continue;
@@ -797,7 +912,7 @@ export default function OrderKioskSplit() {
     }
     
     // Filter items by search query
-    let matchingItems = menuItems;
+    let matchingItems = menuItems.filter(i => !i.is_open_item);
     if (selectedCategoryId !== 'all') {
       matchingItems = matchingItems.filter(item => item.category_id === selectedCategoryId);
     }
@@ -888,7 +1003,14 @@ export default function OrderKioskSplit() {
       toast.error('Cart is empty');
       return;
     }
-    
+    // Ignore a second submit while one is already running — otherwise both runs
+    // work from the same stale cart and save the same items twice.
+    if (submitInFlightRef.current) {
+      console.warn('[submitOrder] Ignored re-entrant submit (one already in flight)');
+      return;
+    }
+    submitInFlightRef.current = true;
+
     setSubmitting(true);
     
     try {
@@ -921,13 +1043,20 @@ export default function OrderKioskSplit() {
         
         for (const cartItem of unifiedCart) {
           await db.upsert('order_items', {
-            id: crypto.randomUUID(),
+            // Use the cart line's OWN stable id as the row id (not a fresh random
+            // one). The upsert is ON CONFLICT(id) DO UPDATE, so if this submit
+            // ever runs twice for the same cart line it UPDATES the same row
+            // instead of inserting a duplicate — which is what silently doubled
+            // quantities on the bill (the bill sums rows by item name).
+            id: cartItem.cartItemId,
             order_id: orderId,
             menu_item_id: cartItem.menuItem.id,
             quantity: cartItem.quantity,
             unit_price: cartItem.unitPrice,
             status: 'pending',
             is_parcel: cartItem.isParcel ? 1 : 0,
+            // Snapshot the GST-exempt flag with the item so reprints tax correctly.
+            is_gst_exempt: cartItem.menuItem.is_gst_exempt ? 1 : 0,
           });
         }
         
@@ -991,7 +1120,11 @@ export default function OrderKioskSplit() {
         console.log('[submitOrder] New items to insert:', newItems.length, newItems.map(i => i.menuItem.name));
         
         for (const cartItem of newItems) {
-          const newItemId = crypto.randomUUID();
+          // Stable id (the cart line's own id) makes this insert idempotent: a
+          // repeated submit of the same cart line updates that row instead of
+          // creating a second one. Random ids here were the cause of quantities
+          // appearing to double (two rows of 4 render as "x8" on the bill).
+          const newItemId = cartItem.cartItemId;
           console.log('[submitOrder] Inserting new order_item:', {
             id: newItemId,
             order_id: currentOrderId,
@@ -1009,6 +1142,7 @@ export default function OrderKioskSplit() {
               unit_price: cartItem.unitPrice,
               status: 'pending',
               is_parcel: cartItem.isParcel ? 1 : 0,
+              is_gst_exempt: cartItem.menuItem.is_gst_exempt ? 1 : 0,
             });
             
             newlyInsertedItemIds.add(newItemId); // Track this newly inserted item
@@ -1035,6 +1169,7 @@ export default function OrderKioskSplit() {
               quantity: cartItem.quantity,
               unit_price: cartItem.unitPrice,
               is_parcel: cartItem.isParcel ? 1 : 0,
+              is_gst_exempt: cartItem.menuItem.is_gst_exempt ? 1 : 0,
               updated_at: new Date().toISOString()
             });
           }
@@ -1093,6 +1228,7 @@ export default function OrderKioskSplit() {
       toast.error(error.message || 'Failed to submit order');
     } finally {
       setSubmitting(false);
+      submitInFlightRef.current = false;
     }
   };
 
@@ -1212,7 +1348,7 @@ export default function OrderKioskSplit() {
           totalAmount += order.total_amount || 0;
           const itemsRes = await localQuery('order_items', { order_id: order.id });
           
-          for (const oi of (itemsRes.data || [])) {
+          for (const oi of inEntryOrder(itemsRes.data || [])) {
             if (!['served', 'cancelled'].includes(oi.status)) {
               const mi = menuItems.find((m: any) => m.id === oi.menu_item_id);
               allItems.push({
@@ -1222,7 +1358,9 @@ export default function OrderKioskSplit() {
                 unit_price: oi.unit_price,
                 status: oi.status,
                 is_parcel: oi.is_parcel,
-                is_gst_exempt: mi?.is_gst_exempt ? 1 : 0,
+                // Prefer the snapshot saved on the order item; fall back to the
+                // menu item for rows saved before the snapshot existed.
+                is_gst_exempt: oi.is_gst_exempt ?? (mi?.is_gst_exempt ? 1 : 0),
                 menu_item: mi ? { name: mi.name } : undefined
               });
             }
@@ -1240,6 +1378,9 @@ export default function OrderKioskSplit() {
         table_id: table.id,
         total_amount: totalAmount,
         bill_number: orders[0].bill_number,
+        // Carry the original order date through so the printed bill (and any
+        // reprint) is dated when the order was raised, not when it was printed.
+        created_at: orders[0].created_at,
         table: { 
           table_number: table.table_number, 
           floor: { name: currentFloor?.name || 'Unknown Floor' } 
@@ -1357,10 +1498,12 @@ export default function OrderKioskSplit() {
       for (const order of orders) {
         subtotal += order.total_amount || 0;
         const itemsRes = await localQuery('order_items', { order_id: order.id });
-        for (const oi of (itemsRes.data || [])) {
+        for (const oi of inEntryOrder(itemsRes.data || [])) {
           if (['served', 'cancelled'].includes(oi.status)) continue;
           const mi = menuItems.find(m => m.id === oi.menu_item_id);
-          if (!(mi && mi.is_gst_exempt)) taxableSubtotal += oi.quantity * oi.unit_price;
+          // Snapshot first, menu item as fallback (pre-snapshot rows).
+          const exempt = oi.is_gst_exempt ?? (mi?.is_gst_exempt ? 1 : 0);
+          if (!exempt) taxableSubtotal += oi.quantity * oi.unit_price;
           rawItems.push({
             menu_item: mi ? { name: mi.name } : undefined,
             quantity: oi.quantity,
@@ -1397,6 +1540,7 @@ export default function OrderKioskSplit() {
         floorName,
         orderId: mainOrder.id,
         billNumber,
+        billDate: mainOrder.created_at,
         showQrCode: (currentRestaurant as any)?.print_qr_on_bill !== false,
         paymentQrContent: (currentRestaurant as any)?.payment_qr_content,
         items: groupOrderItemsForBill(rawItems).map(i => ({ name: i.name, quantity: i.quantity, price: i.unit_price })),
@@ -1549,6 +1693,13 @@ export default function OrderKioskSplit() {
       
       // Enter: Submit order or open billing
       if (e.key === 'Enter' && !isInputField && selectedTable) {
+        // Holding Enter fires this repeatedly; each repeat used to launch another
+        // submit with the same cart, saving the items again. Ignore auto-repeat
+        // and any press while a submit is still running.
+        if (e.repeat || submitInFlightRef.current) {
+          e.preventDefault();
+          return;
+        }
         if (unifiedCart.some(item => item.isNew || item.isModified)) {
           // First Enter: Submit/update order
           e.preventDefault();
@@ -1570,8 +1721,10 @@ export default function OrderKioskSplit() {
   // ============================================================================
 
   const filteredMenuItems = useMemo(() => {
-    let items = menuItems;
-    
+    // Open items live in `menuItems` only so past orders can resolve them; they
+    // are one-offs and must never appear as re-orderable tiles in the grid.
+    let items = menuItems.filter(i => !i.is_open_item);
+
     if (selectedCategoryId !== 'all') {
       items = items.filter(item => item.category_id === selectedCategoryId);
     }
@@ -1784,7 +1937,19 @@ export default function OrderKioskSplit() {
                 )}
               </div>
               
-              <div className="flex gap-2 overflow-x-auto">
+              <div className="flex gap-2 overflow-x-auto items-center">
+                {/* One-off custom line (day's special / off-menu request) */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0 border-dashed border-primary/60 text-primary hover:bg-primary/10"
+                  onClick={() => setOpenItemDialogOpen(true)}
+                  disabled={!selectedTable}
+                  title={selectedTable ? 'Add a one-off item with a custom name and price' : 'Select a table first'}
+                >
+                  <Plus className="w-4 h-4 mr-1" />
+                  Open Item
+                </Button>
                 <Button
                   variant={selectedCategoryId === 'all' ? 'default' : 'outline'}
                   size="sm"
@@ -2072,6 +2237,84 @@ export default function OrderKioskSplit() {
         showQrCode={currentRestaurant?.print_qr_on_bill !== false}
         paymentQrContent={(currentRestaurant as any)?.payment_qr_content}
       />
+
+      {/* Open item — one-off custom line for this order only */}
+      <Dialog
+        open={openItemDialogOpen}
+        onOpenChange={(o) => {
+          setOpenItemDialogOpen(o);
+          if (!o) { setOpenItemName(''); setOpenItemPrice(''); setOpenItemGstExempt(false); }
+        }}
+      >
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Add Open Item</DialogTitle>
+            <DialogDescription>
+              A one-off item for this bill only — a day's special or an off-menu
+              request. It is not added to your menu.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Item name</label>
+              <Input
+                autoFocus
+                placeholder="e.g. Today's Special Thali"
+                value={openItemName}
+                onChange={(e) => setOpenItemName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addOpenItem(); } }}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Price (₹)</label>
+              <Input
+                type="number"
+                min="0"
+                inputMode="decimal"
+                placeholder="0"
+                value={openItemPrice}
+                onChange={(e) => setOpenItemPrice(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addOpenItem(); } }}
+              />
+            </div>
+
+            <label className="flex items-center justify-between rounded-lg border p-3 cursor-pointer">
+              <span>
+                <span className="text-sm font-medium">GST exempt</span>
+                <span className="block text-xs text-muted-foreground">
+                  Leave off to charge GST on this item like any other
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                className="h-4 w-4"
+                checked={openItemGstExempt}
+                onChange={(e) => setOpenItemGstExempt(e.target.checked)}
+              />
+            </label>
+
+            <div className="flex gap-2 pt-1">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={() => setOpenItemDialogOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="gradient"
+                className="flex-1"
+                onClick={addOpenItem}
+                disabled={openItemSaving}
+              >
+                {openItemSaving ? 'Adding…' : 'Add to Order'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Move / change table */}
       <Dialog open={moveDialogOpen} onOpenChange={(open) => { setMoveDialogOpen(open); if (!open) setMoveSourceTable(null); }}>

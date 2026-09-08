@@ -45,6 +45,13 @@ const TABLES_SCHEMA = `
     notes TEXT,
     status TEXT DEFAULT 'pending',
     is_parcel INTEGER DEFAULT 0,
+    -- Snapshot of the menu item's GST-exempt flag AT THE TIME THE ITEM WAS ORDERED
+    -- (like unit_price). Nullable on purpose: NULL means "not recorded" (rows
+    -- created before this column existed) and callers fall back to the menu
+    -- item's current flag. Storing it here is what makes reprints from Reports /
+    -- Orders tax correctly — those screens read order_items without joining the
+    -- exempt flag, so without this snapshot GST was charged on exempt items.
+    is_gst_exempt INTEGER,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     sync_status TEXT DEFAULT 'pending_sync',
@@ -78,6 +85,12 @@ const TABLES_SCHEMA = `
     shortcut_code TEXT,
     sort_order INTEGER DEFAULT 0,
     is_gst_exempt INTEGER DEFAULT 0,
+    -- 1 = "open item": a one-off custom line (day's special / off-menu request)
+    -- typed in while taking an order. It is stored as a normal menu item so the
+    -- cart, KOT, bill and reports resolve its name and price like any other,
+    -- but it is hidden from the menu grid and the Menu manager so it is never
+    -- re-ordered or maintained as part of the real menu.
+    is_open_item INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     sync_status TEXT DEFAULT 'synced'
@@ -338,12 +351,24 @@ export class LocalDatabase {
         this.db.exec('ALTER TABLE order_items ADD COLUMN is_parcel INTEGER DEFAULT 0');
       }
 
+      // Snapshot column on order_items (nullable → NULL = fall back to menu item).
+      if (oiCols.length > 0 && !oiCols.some((c: any) => c.name === 'is_gst_exempt')) {
+        console.log('[LocalDB] Schema migration: order_items adding is_gst_exempt');
+        this.db.exec('ALTER TABLE order_items ADD COLUMN is_gst_exempt INTEGER');
+      }
+
       // Per-item GST exemption: menu items flagged here are excluded from the GST
       // base at billing time. Default 0 → every existing item is taxed as before.
       const miCols = this.db.prepare("PRAGMA table_info('menu_items')").all() as any[];
       if (miCols.length > 0 && !miCols.some((c: any) => c.name === 'is_gst_exempt')) {
         console.log('[LocalDB] Schema migration: menu_items adding is_gst_exempt');
         this.db.exec('ALTER TABLE menu_items ADD COLUMN is_gst_exempt INTEGER DEFAULT 0');
+      }
+
+      // One-off "open item" lines typed in during order taking.
+      if (miCols.length > 0 && !miCols.some((c: any) => c.name === 'is_open_item')) {
+        console.log('[LocalDB] Schema migration: menu_items adding is_open_item');
+        this.db.exec('ALTER TABLE menu_items ADD COLUMN is_open_item INTEGER DEFAULT 0');
       }
 
       // Table over-time alert threshold (minutes; 0 = disabled), set on the server.
@@ -404,8 +429,18 @@ export class LocalDatabase {
     // Non-destructive upsert: update ONLY the columns provided; leave all other
     // existing columns untouched. (A partial update like { id, is_occupied }
     // must not disturb floor_id, table_number, capacity, etc.)
+    //
+    // created_at is excluded from the UPDATE on purpose — a row is created once
+    // and that timestamp is immutable. The write layer fills in a created_at of
+    // "now" whenever a caller sends a partial patch that omits it (e.g. the
+    // {id, bill_number} patch written when a bill is printed, or the
+    // {id, status, payment_method} patch written on payment). Letting that reach
+    // the UPDATE clause silently reset the order's creation time to the moment
+    // it was printed/settled — which made reprinted bills show the current time
+    // instead of when the order was raised, and moved orders into the wrong day
+    // in Reports and in the daily bill-number lookup.
     const updates = columns
-      .filter(c => c !== 'id')
+      .filter(c => c !== 'id' && c !== 'created_at')
       .map(c => `${c} = excluded.${c}`)
       .join(', ');
 

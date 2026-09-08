@@ -186,6 +186,9 @@ export default function Menu() {
           if (itemsRes.fromCache) {
             items = items.filter(i => categoryIds.includes(i.category_id));
           }
+          // Open items are one-off lines created while billing, not real menu
+          // entries — keep them out of the menu manager.
+          items = items.filter(i => !(i as any).is_open_item);
           // Show in the saved drag order (sort_order). Tiebreak must MATCH the
           // kiosk (created_at, then name) so the default order is identical on
           // both screens when items haven't been dragged yet.

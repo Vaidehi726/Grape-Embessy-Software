@@ -28,7 +28,7 @@ import {
 import { Usb } from 'lucide-react';
 import { useThermalPrinter } from '@/hooks/useThermalPrinter';
 import { useUSBPrinter } from '@/hooks/useUSBPrinter';
-import { isElectron, printerBridge } from '@/services/printerBridge';
+import { isElectron, printerBridge, printBillAuto } from '@/services/printerBridge';
 import { getNextBillNumber } from '@/services/dailyBillNumber';
 import { offlineMutate } from '@/services/offlineDataService';
 import { PrinterSelector } from '@/components/PrinterSelector';
@@ -49,6 +49,9 @@ interface BillingOrder {
   id: string;
   table_id: string | null;
   total_amount: number;
+  /** When the order was raised — printed as the bill date so reprints of past
+   *  bills don't show today's date. */
+  created_at?: string;
   discount_amount?: number | null;
   table?: { table_number: string; floor: { name: string } };
   order_items: OrderItem[];
@@ -253,6 +256,9 @@ export function BillingDialog({
       tableNumber: order.table?.table_number,
       orderId: order.id,
       billNumber: billNumberOverride ?? effectiveBillNumber ?? undefined,
+      // Print the date the order was raised (not "now"), so reprinting a bill
+      // from History shows its original date.
+      billDate: (order as any).created_at,
       showQrCode,
       paymentQrContent,
       customerName: customerName.trim() || undefined,
@@ -484,45 +490,62 @@ export function BillingDialog({
     }
   };
 
-  // Enter key shortcut to print bill via USB when dialog is open
+  // One-key finish: print the bill, settle it as cash, then let the parent close
+  // the dialog (its onPaymentComplete does that) so the cashier lands straight
+  // back on the Order KOT screen — no Back click.
+  //
+  // Order matters: we PRINT FIRST and only settle + close if the print actually
+  // went through. If printing fails the dialog stays open with the bill intact,
+  // so a bill can never be silently closed/lost on a printer error.
+  const finalizingRef = useRef(false);
+  const finalizeBill = async () => {
+    if (finalizingRef.current) return; // ignore double Enter / double click
+    finalizingRef.current = true;
+    try {
+      const billNumber = await ensureBillNumber();
+      const billData = getBillData(billNumber);
+      if (!billData) return;
+
+      const method = await printBillAuto(billData);
+      toast.success(
+        method === 'browser' ? 'Bill opened in print dialog' : 'Receipt printed'
+      );
+
+      // Printing succeeded → settle and close.
+      await handlePayment('cash');
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to print bill — bill kept open');
+    } finally {
+      finalizingRef.current = false;
+    }
+  };
+
+  // Keyboard: Enter = print + settle + close. "1" = settle in cash only.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!open) return;
-      
+
       const target = e.target as HTMLElement;
       const isInputField = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
-      
-      // Number keys (1-3): Select payment method and process payment
-      if (!isInputField && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        const key = e.key;
-        if (key === '1') {
-          e.preventDefault();
-          handlePayment('cash');
-        } else if (key === '2') {
-          e.preventDefault();
-          handlePayment('card');
-        } else if (key === '3') {
-          e.preventDefault();
-          handlePayment('upi');
-        }
-      }
-      
-      // Enter: Print bill via USB
-      if (e.key === 'Enter' && !isInputField && (connectedPrinter || isElectronApp)) {
+      if (isInputField || e.ctrlKey || e.metaKey || e.altKey) return;
+
+      if (e.key === '1') {
         e.preventDefault();
-        if (connectedPrinter) {
-          handlePrintBill('usb');
-        } else if (isElectronApp && windowsPrinters.length > 0) {
-          // Auto-print to first available Windows printer
-          setSelectedWindowsPrinter(windowsPrinters[0]);
-          setTimeout(() => handlePrintBill('windows'), 100);
-        }
+        handlePayment('cash');
+        return;
+      }
+
+      if (e.key === 'Enter') {
+        // Ignore auto-repeat so holding Enter can't fire this twice.
+        e.preventDefault();
+        if (e.repeat || finalizingRef.current) return;
+        finalizeBill();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, connectedPrinter, isElectronApp, windowsPrinters, handlePrintBill, handlePayment]);
+  }, [open, connectedPrinter, isElectronApp, windowsPrinters, finalizeBill, handlePayment]);
 
   const handleOpenChange = (newOpen: boolean) => {
     onOpenChange(newOpen);
@@ -685,81 +708,31 @@ export function BillingDialog({
               <div className="space-y-4">
               {/* Print Options */}
               <div className="space-y-2">
-                <div className="flex gap-2">
-                  {/* USB Thermal Print */}
-                  {(isUSBAvailable || isElectronApp) && (
-                    <div className="flex flex-1 gap-1">
-                      <Button 
-                        variant={connectedPrinter ? 'default' : 'outline'}
-                        className={`flex-1 ${connectedPrinter ? 'bg-primary' : ''}`}
-                        onClick={() => {
-                          if (connectedPrinter) {
-                            handlePrintBill('usb');
-                          } else if (isElectronApp) {
-                            setShowDeviceList(!showDeviceList);
-                          } else {
-                            handleConnectUSB();
-                          }
-                        }}
-                        disabled={usbPrinting}
-                      >
-                        <Usb className="w-4 h-4 mr-2" />
-                        {connectedPrinter ? `Print (${connectedPrinter.name.substring(0, 12)})` : 'Connect USB Printer'}
-                        {connectedPrinter && <kbd className="ml-2 px-2 py-0.5 text-xs bg-white/20 rounded">Enter</kbd>}
-                      </Button>
-                      {/* Change printer button — only visible when a printer is already connected */}
-                      {connectedPrinter && isElectronApp && (
-                        <Button
-                          variant="outline"
-                          size="icon"
-                          title="Change printer"
-                          onClick={() => setShowDeviceList(!showDeviceList)}
-                        >
-                          <Settings2 className="w-4 h-4" />
-                        </Button>
-                      )}
-                    </div>
-                  )}
-                  {/* Browser Print - Fallback */}
-                  <Button variant="outline" className={(isUSBAvailable || isElectronApp) ? '' : 'flex-1'} onClick={() => handlePrintBill('browser')} disabled={printing}>
-                    <Printer className="w-4 h-4 mr-2" />
-                    Browser
-                  </Button>
-                  {/* Bluetooth - Mobile only */}
-                  {isBluetoothAvailable && (
-                    <Button 
-                      variant="outline" 
-                      className={connectedDevice ? 'border-success text-success' : ''}
-                      onClick={() => connectedDevice ? handlePrintBill('bluetooth') : setPrinterSelectorOpen(true)}
-                      disabled={printing}
-                    >
-                      <Bluetooth className="w-4 h-4 mr-2" />
-                      BT
-                    </Button>
-                  )}
-                </div>
+                {/* Primary action. Enter does the same thing: print, settle in
+                    cash, then close the dialog and drop back to the Order KOT
+                    screen — no Back click needed. */}
+                <Button
+                  size="lg"
+                  className="w-full h-14 text-base"
+                  onClick={finalizeBill}
+                  disabled={printing || usbPrinting || processingPayment}
+                >
+                  <Printer className="w-5 h-5 mr-2" />
+                  Print Bill
+                  <kbd className="ml-2 px-2 py-0.5 text-xs bg-white/20 rounded">Enter</kbd>
+                </Button>
 
-                {/* Print Summary Button - Items only, no prices */}
-                <div className="flex gap-2 pt-2 border-t">
-                  <Button 
-                    variant="outline" 
-                    className="flex-1 border-dashed"
-                    onClick={() => handlePrintSummary()}  // Default to 'usb', will auto-fallback
-                    disabled={printing || usbPrinting}
-                  >
-                    <FileText className="w-4 h-4 mr-2" />
-                    Print Summary (Items Only)
-                  </Button>
-                  {isBluetoothAvailable && (
-                    <Button 
-                      variant="outline"
-                      onClick={() => handlePrintSummary('bluetooth')}
-                      disabled={printing || !connectedDevice}
-                    >
-                      <Bluetooth className="w-4 h-4" />
-                    </Button>
-                  )}
-                </div>
+                {/* Printer picking kept, just tucked away so the main screen stays
+                    to the two actions the cashier needs. */}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="w-full text-xs text-muted-foreground"
+                  onClick={() => setShowDeviceList(!showDeviceList)}
+                >
+                  <Settings2 className="w-3.5 h-3.5 mr-1.5" />
+                  {showDeviceList ? 'Hide printer settings' : 'Printer settings'}
+                </Button>
 
                 {/* Electron Device List — shown when no printer OR when changing printer */}
                 {isElectronApp && showDeviceList && (
@@ -817,7 +790,7 @@ export function BillingDialog({
                 )}
 
                 {/* Windows Printer Selector - always show in Electron mode */}
-                {isElectronApp && (
+                {isElectronApp && showDeviceList && (
                   <div className="border rounded-lg p-3 space-y-2 bg-muted/30">
                     <div className="flex items-center justify-between">
                       <Label className="text-sm font-medium">Windows Printer</Label>
@@ -896,47 +869,21 @@ export function BillingDialog({
                 )}
               </div>
 
-              {/* Payment Methods */}
+              {/* Payment — cash only (card/UPI removed per operator request) */}
               <div className="space-y-2">
-                <Label>Select Payment Method</Label>
-                <div className="grid grid-cols-3 gap-2">
-                  <Button
-                    variant="outline"
-                    className="flex flex-col items-center gap-1 h-auto py-4 relative"
-                    onClick={() => handlePayment('cash')}
-                    disabled={processingPayment}
-                  >
-                    <div className="absolute top-1 right-1 bg-primary text-primary-foreground text-xs font-bold w-5 h-5 rounded flex items-center justify-center">
-                      1
-                    </div>
-                    <Banknote className="w-6 h-6" />
-                    <span className="text-xs">Cash</span>
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="flex flex-col items-center gap-1 h-auto py-4 relative"
-                    onClick={() => handlePayment('card')}
-                    disabled={processingPayment}
-                  >
-                    <div className="absolute top-1 right-1 bg-primary text-primary-foreground text-xs font-bold w-5 h-5 rounded flex items-center justify-center">
-                      2
-                    </div>
-                    <CreditCard className="w-6 h-6" />
-                    <span className="text-xs">Card</span>
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="flex flex-col items-center gap-1 h-auto py-4 relative"
-                    onClick={() => handlePayment('upi')}
-                    disabled={processingPayment}
-                  >
-                    <div className="absolute top-1 right-1 bg-primary text-primary-foreground text-xs font-bold w-5 h-5 rounded flex items-center justify-center">
-                      3
-                    </div>
-                    <Smartphone className="w-6 h-6" />
-                    <span className="text-xs">UPI</span>
-                  </Button>
-                </div>
+                <Label>Payment</Label>
+                <Button
+                  variant="outline"
+                  className="w-full h-14 flex items-center justify-center gap-2 relative"
+                  onClick={() => handlePayment('cash')}
+                  disabled={processingPayment}
+                >
+                  <div className="absolute top-1 right-1 bg-primary text-primary-foreground text-xs font-bold w-5 h-5 rounded flex items-center justify-center">
+                    1
+                  </div>
+                  <Banknote className="w-5 h-5" />
+                  <span>Cash</span>
+                </Button>
               </div>
               </div>{/* ── end RIGHT COLUMN ── */}
             </div>

@@ -2,7 +2,7 @@
 // Detects environment automatically and routes to the correct implementation
 
 import { usbPrinter, USBPrinterDevice } from './usbPrinter';
-import { thermalPrinter } from './thermalPrinter';
+import { thermalPrinter, formatBillDate } from './thermalPrinter';
 import type { BillData, SummaryPrintData } from './thermalPrinter';
 
 // Type for the Electron API exposed via preload
@@ -207,7 +207,9 @@ function buildReceipt(bill: BillData): Uint8Array {
   // centering keeps the columns aligned while giving symmetric margins — the
   // receipt stays readable even if the printer's horizontal alignment drifts.
   add(CMD.ALIGN_CENTER);
-  const billDate = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+  // Use the order's own date so a reprint of a past bill shows the date the bill
+  // was raised, not today's.
+  const billDate = formatBillDate(bill.billDate);
   text(`Table: ${bill.tableNumber || 'Takeaway'}`); nl();
   text(`Date: ${billDate}`); nl();
   

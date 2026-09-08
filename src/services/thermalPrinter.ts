@@ -15,6 +15,11 @@ export interface BillData {
   floorName?: string;
   orderId?: string;
   billNumber?: number;
+  /** When the order was placed (ISO string, normally orders.created_at). Printed
+   *  as the bill date. Omit for a brand-new bill and "now" is used. Reprinting a
+   *  past bill MUST pass this, otherwise the receipt shows today's date instead
+   *  of the date the bill was actually raised. */
+  billDate?: string;
   showQrCode?: boolean;
   paymentQrContent?: string | null;
   customerName?: string;
@@ -32,6 +37,17 @@ export interface BillData {
   cgstAmount?: number;
   sgstAmount?: number;
   total: number;
+}
+
+/**
+ * Format the date to print on a bill. Uses the order's own date when supplied
+ * (so a reprint of an old bill shows the ORIGINAL date, not today's) and falls
+ * back to now for a fresh bill. Guards against an unparseable value.
+ */
+export function formatBillDate(iso?: string): string {
+  const d = iso ? new Date(iso) : new Date();
+  const safe = isNaN(d.getTime()) ? new Date() : d;
+  return safe.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 }
 
 /**
@@ -177,10 +193,7 @@ class ThermalPrinterService {
       throw new Error('No printer connected. Please connect a printer first.');
     }
 
-    const billDate = new Date().toLocaleString('en-IN', {
-      dateStyle: 'medium',
-      timeStyle: 'short',
-    });
+    const billDate = formatBillDate(bill.billDate);
 
     try {
       // Build the receipt using ESC/POS commands
@@ -292,10 +305,7 @@ class ThermalPrinterService {
   }
 
   printViaBrowser(bill: BillData): void {
-    const billDate = new Date().toLocaleString('en-IN', {
-      dateStyle: 'medium',
-      timeStyle: 'short',
-    });
+    const billDate = formatBillDate(bill.billDate);
 
     const itemsHtml = bill.items
       .map(
