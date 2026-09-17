@@ -182,6 +182,13 @@ const TABLES_SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
+  -- Indexes for the hot till queries. Without these, every "live orders for this
+  -- table" / "find bill #N" lookup is a full scan of the whole order history,
+  -- which is what slowed sites down once they passed a few thousand orders.
+  CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+  CREATE INDEX IF NOT EXISTS idx_orders_table_status ON orders(table_id, status);
+  CREATE INDEX IF NOT EXISTS idx_orders_bill_number ON orders(bill_number);
+  CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
   CREATE INDEX IF NOT EXISTS idx_orders_sync ON orders(sync_status);
   CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
   CREATE INDEX IF NOT EXISTS idx_order_items_sync ON order_items(sync_status);
@@ -393,13 +400,19 @@ export class LocalDatabase {
     const params: any[] = [];
 
     if (filters && Object.keys(filters).length > 0) {
-      const conditions = Object.entries(filters).map(([key, _value]) => {
-        // Convert boolean to integer for SQLite compatibility
-        if (typeof _value === 'boolean') {
-          params.push(_value ? 1 : 0);
-        } else {
-          params.push(_value);
+      const conditions = Object.entries(filters).map(([key, value]) => {
+        // An array value becomes `col IN (...)`. This lets hot screens ask the
+        // database for just the rows they need (e.g. only the handful of live
+        // orders) instead of pulling the whole table back and filtering it in
+        // JavaScript — which is what made the app crawl once a site built up
+        // tens of thousands of historical orders.
+        if (Array.isArray(value)) {
+          if (value.length === 0) return '0'; // match nothing, rather than everything
+          for (const v of value) params.push(typeof v === 'boolean' ? (v ? 1 : 0) : v);
+          return `${key} IN (${value.map(() => '?').join(',')})`;
         }
+        // Convert boolean to integer for SQLite compatibility
+        params.push(typeof value === 'boolean' ? (value ? 1 : 0) : value);
         return `${key} = ?`;
       });
       sql += ` WHERE ${conditions.join(' AND ')}`;

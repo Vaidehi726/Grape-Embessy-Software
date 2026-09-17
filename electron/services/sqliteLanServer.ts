@@ -80,7 +80,14 @@ export class SqliteLanServer {
         const conditions = Object.entries(filters);
         if (conditions.length > 0) {
           sql += ' WHERE ' + conditions.map(([key, value]) => {
-            params.push(value);
+            // Array value → `col IN (...)`, so a client can ask for just the live
+            // orders instead of downloading the entire order history over HTTP.
+            if (Array.isArray(value)) {
+              if (value.length === 0) return '0'; // match nothing
+              for (const v of value) params.push(typeof v === 'boolean' ? (v ? 1 : 0) : v);
+              return `${key} IN (${value.map(() => '?').join(',')})`;
+            }
+            params.push(typeof value === 'boolean' ? (value ? 1 : 0) : value);
             return `${key} = ?`;
           }).join(' AND ');
         }

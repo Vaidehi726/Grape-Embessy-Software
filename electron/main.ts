@@ -213,6 +213,39 @@ function registerDbHandlers() {
     }
   });
 
+  // ── Database maintenance (archive old orders) ───────────────────
+  ipcMain.handle('db:archive-preview', async (_event, cutoffIso?: string) => {
+    try {
+      const { previewArchive, startOfCurrentMonthIso } = await import('./services/dataMaintenance.js');
+      const cutoff = cutoffIso || startOfCurrentMonthIso();
+      return { success: true, data: previewArchive(app.getPath('userData'), cutoff) };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('db:archive-run', async (_event, cutoffIso?: string) => {
+    try {
+      const { archiveOldData, startOfCurrentMonthIso } = await import('./services/dataMaintenance.js');
+      const cutoff = cutoffIso || startOfCurrentMonthIso();
+      // The LAN server holds a second connection to the same file; stop it so the
+      // VACUUM can rebuild the database cleanly, then bring it back up.
+      const wasRunning = autoLanServer?.getStatus().isRunning ?? false;
+      if (wasRunning && autoLanServer) await autoLanServer.stop();
+
+      const result = archiveOldData(app.getPath('userData'), cutoff);
+
+      if (wasRunning) {
+        autoLanServer = createSqliteLanServer(app.getPath('userData'));
+        await autoLanServer.start();
+      }
+      return { success: true, data: result };
+    } catch (err: any) {
+      console.error('[Main] Archive failed:', err);
+      return { success: false, error: err.message };
+    }
+  });
+
   ipcMain.handle('db:next-bill-number', async () => {
     try {
       return { success: true, billNumber: localDb!.getNextBillNumber() };

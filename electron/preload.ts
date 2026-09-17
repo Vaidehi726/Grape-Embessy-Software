@@ -30,6 +30,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     clearTable: (table: string) =>
       ipcRenderer.invoke('db:clear-table', table),
     nextBillNumber: () => ipcRenderer.invoke('db:next-bill-number'),
+    // Maintenance: report / remove old orders. Preview changes nothing.
+    archivePreview: (cutoffIso?: string) =>
+      ipcRenderer.invoke('db:archive-preview', cutoffIso),
+    archiveRun: (cutoffIso?: string) =>
+      ipcRenderer.invoke('db:archive-run', cutoffIso),
   },
 
   // ── Sync ────────────────────────────────────────────────────────

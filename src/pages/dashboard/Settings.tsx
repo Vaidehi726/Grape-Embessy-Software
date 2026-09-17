@@ -54,6 +54,10 @@ export default function Settings() {
     lock_saved_items: false,
     table_alert_minutes: '',
   });
+  // Database maintenance (archive old orders)
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveInfo, setArchiveInfo] = useState<any>(null);
+  const [archiveResult, setArchiveResult] = useState<any>(null);
 
   // Poll pending count
   useEffect(() => {
@@ -193,6 +197,54 @@ export default function Settings() {
       });
     } finally {
       setFactoryResetting(false);
+    }
+  };
+
+  // ── Database maintenance ────────────────────────────────────────
+  const handleArchivePreview = async () => {
+    setArchiveBusy(true);
+    setArchiveResult(null);
+    try {
+      const res = await (window as any).electronAPI?.db?.archivePreview?.();
+      if (res?.success) {
+        setArchiveInfo(res.data);
+        if (res.data.ordersToDelete === 0) {
+          toast({ title: 'Nothing to clean', description: 'There are no finished orders older than this month.' });
+        }
+      } else {
+        toast({ title: 'Could not check', description: res?.error || 'Unknown error', variant: 'destructive' });
+      }
+    } finally {
+      setArchiveBusy(false);
+    }
+  };
+
+  const handleArchiveRun = async () => {
+    if (!archiveInfo) return;
+    const ok = window.confirm(
+      `Remove ${archiveInfo.ordersToDelete.toLocaleString('en-IN')} finished orders from before this month?\n\n` +
+      `• ${archiveInfo.ordersKeptRecent.toLocaleString('en-IN')} orders from this month are kept\n` +
+      `• Orders still running are kept\n` +
+      `• A full backup of the database is saved first\n\n` +
+      `This cannot be undone from inside the app (restore the backup file if needed).`
+    );
+    if (!ok) return;
+
+    setArchiveBusy(true);
+    try {
+      const res = await (window as any).electronAPI?.db?.archiveRun?.();
+      if (res?.success) {
+        setArchiveResult(res.data);
+        setArchiveInfo(res.data);
+        toast({
+          title: 'Old data cleaned',
+          description: `Removed ${res.data.deletedOrders.toLocaleString('en-IN')} orders. Database ${res.data.dbSizeMb} MB → ${res.data.dbSizeMbAfter} MB. Backup saved.`,
+        });
+      } else {
+        toast({ title: 'Clean failed', description: res?.error || 'Unknown error', variant: 'destructive' });
+      }
+    } finally {
+      setArchiveBusy(false);
     }
   };
 
@@ -498,6 +550,83 @@ export default function Settings() {
             </Button>
           </CardContent>
         </Card>
+
+        {/* Database maintenance — archive old orders to keep the app fast */}
+        {isElectron() && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Database className="w-5 h-5" />
+                Database Maintenance
+              </CardTitle>
+              <CardDescription>
+                Removes finished orders from before this month to keep the database
+                small. A full backup of the database is saved automatically first,
+                and orders that are still running are never removed.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" onClick={handleArchivePreview} disabled={archiveBusy}>
+                  {archiveBusy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                  Check what would be removed
+                </Button>
+                <Button
+                  variant="destructive"
+                  onClick={handleArchiveRun}
+                  disabled={archiveBusy || !archiveInfo || archiveInfo.ordersToDelete === 0}
+                >
+                  {archiveBusy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                  Back up &amp; clean old data
+                </Button>
+              </div>
+
+              {archiveInfo && (
+                <div className="rounded-lg border p-4 text-sm space-y-1.5 bg-muted/30">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Keeping everything from</span>
+                    <span className="font-medium">
+                      {new Date(archiveInfo.cutoffIso).toLocaleDateString('en-IN', { dateStyle: 'medium' })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Orders in database</span>
+                    <span className="font-medium">{archiveInfo.totalOrders.toLocaleString('en-IN')}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">This month (kept)</span>
+                    <span className="font-medium">{archiveInfo.ordersKeptRecent.toLocaleString('en-IN')}</span>
+                  </div>
+                  <div className="flex justify-between text-destructive">
+                    <span>Old orders to remove</span>
+                    <span className="font-semibold">
+                      {archiveInfo.ordersToDelete.toLocaleString('en-IN')}
+                      {' '}({archiveInfo.itemsToDelete.toLocaleString('en-IN')} items)
+                    </span>
+                  </div>
+                  {archiveInfo.staleLiveOrders > 0 && (
+                    <div className="flex justify-between text-amber-700">
+                      <span>Old but still running — kept for you to review</span>
+                      <span className="font-semibold">{archiveInfo.staleLiveOrders}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between border-t pt-1.5 mt-1.5">
+                    <span className="text-muted-foreground">Database size</span>
+                    <span className="font-medium">
+                      {archiveInfo.dbSizeMb} MB
+                      {archiveResult ? ` → ${archiveResult.dbSizeMbAfter} MB` : ''}
+                    </span>
+                  </div>
+                  {archiveResult && (
+                    <p className="text-xs text-muted-foreground break-all pt-1">
+                      Backup saved to: {archiveResult.backupPath}
+                    </p>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
 
         {/* Data Sync Section - Electron Only */}
         {isElectron() && (

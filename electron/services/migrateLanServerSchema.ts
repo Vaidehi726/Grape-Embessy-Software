@@ -335,6 +335,10 @@ export class LanServerSchemaMigration {
 
     const indexes = [
       'CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)',
+      // Hot till lookups: live orders for a table, and find-by-bill-number.
+      'CREATE INDEX IF NOT EXISTS idx_orders_table_status ON orders(table_id, status)',
+      'CREATE INDEX IF NOT EXISTS idx_orders_bill_number ON orders(bill_number)',
+      'CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)',
       'CREATE INDEX IF NOT EXISTS idx_order_items_status ON order_items(status)',
       'CREATE INDEX IF NOT EXISTS idx_menu_categories_restaurant ON menu_categories(restaurant_id)',
       'CREATE INDEX IF NOT EXISTS idx_kitchens_restaurant ON kitchens(restaurant_id)',

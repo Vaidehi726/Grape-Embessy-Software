@@ -128,6 +128,12 @@ const SpiceLevelIndicator = ({ level }: { level: 'mild' | 'medium' | 'spicy' | '
   );
 };
 
+// The statuses that count as a "live" bill. Previously every screen fetched the
+// WHOLE orders table and filtered on exactly this list in JavaScript; passing it
+// to the query instead returns the identical rows, just without dragging the
+// site's entire order history through IPC/HTTP first.
+const ACTIVE_ORDER_STATUSES = ['pending', 'cooking', 'ready'];
+
 // Put order items back in the order they were ADDED.
 //
 // The data layer doesn't guarantee this: local SQLite returns every query as
@@ -183,6 +189,16 @@ export default function OrderKioskSplit() {
   const [unifiedCart, setUnifiedCart] = useState<UnifiedCartItem[]>([]);
   const [currentOrderId, setCurrentOrderId] = useState<string | null>(null);
   const [currentBillNumber, setCurrentBillNumber] = useState<number | null>(null);
+  // Set when ONE specific bill was opened by bill-number search (e.g. reopening
+  // past bill #59 on a table that is currently running bill #67).
+  //
+  // Everything else in this screen works "per table": it gathers every active
+  // order on the table and sums them into one cart/receipt. That is fine when a
+  // table has a single live bill, but while a past bill is open it would fold
+  // the running bill into it — printing both under the past bill's number.
+  // While this is set, every edit / bill / print / settle applies to this one
+  // order only. Cleared whenever the user goes back to normal table working.
+  const [focusedOrderId, setFocusedOrderId] = useState<string | null>(null);
   
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategoryId, setSelectedCategoryId] = useState<string>('all');
@@ -329,10 +345,13 @@ export default function OrderKioskSplit() {
 
       if (occupiedTableIds.length > 0) {
         try {
-          const ordersRes = await localQuery('orders');
-          const ordersData = (ordersRes.data || []).filter((o: any) => 
-            occupiedTableIds.includes(o.table_id) && 
-            ['pending', 'cooking', 'ready'].includes(o.status)
+          // Ask the DB for ONLY the live orders. This runs on mount, on every LAN
+          // change and every 10s — fetching the whole orders table here is what
+          // ground the app to a halt once a site accumulated tens of thousands of
+          // historical orders.
+          const ordersRes = await localQuery('orders', { status: ACTIVE_ORDER_STATUSES });
+          const ordersData = (ordersRes.data || []).filter((o: any) =>
+            occupiedTableIds.includes(o.table_id)
           );
 
           if (ordersData) {
@@ -438,13 +457,15 @@ export default function OrderKioskSplit() {
   const loadTableOrder = async (table: Table) => {
     try {
       const { localQuery } = await import('@/services/localDataService');
-      const ordersRes = await localQuery('orders');
-      
-      const orders = (ordersRes.data || []).filter((o: any) => 
-        o.table_id === table.id && 
-        ['pending', 'cooking', 'ready'].includes(o.status)
-      );
-      
+      // Same rows as before (this table's live orders), but selected by the DB
+      // instead of scanning every order ever placed.
+      const ordersRes = await localQuery('orders', {
+        table_id: table.id,
+        status: ACTIVE_ORDER_STATUSES,
+      });
+
+      const orders = ordersRes.data || [];
+
       if (orders && orders.length > 0) {
         const cartItems: UnifiedCartItem[] = [];
         const mainOrder = orders[0];
@@ -518,6 +539,9 @@ export default function OrderKioskSplit() {
     setUnifiedCart([]);
     setCurrentOrderId(null);
     setCurrentBillNumber(null);
+    // Picking a table is normal table working again — stop pinning to whatever
+    // past bill may have been opened by bill-number search.
+    setFocusedOrderId(null);
     await loadTableOrder(table);
   };
 
@@ -838,6 +862,46 @@ export default function OrderKioskSplit() {
   // BILL NUMBER SEARCH & AUTO-SELECTION
   // ============================================================================
 
+  /**
+   * Which order(s) a bill / print / settle action should cover.
+   *
+   * Default (normal table working): every active order on the table, summed —
+   * the long-standing behaviour.
+   *
+   * When a specific bill has been opened by bill-number search: ONLY that bill,
+   * whatever its status. Without this, reopening past bill #59 on a table that
+   * is currently running bill #67 made the receipt contain both bills' items and
+   * print under #59 — the running table's food silently absorbed into a closed
+   * bill.
+   */
+  const ordersForBilling = (allOrders: any[], tableId: string): any[] => {
+    if (focusedOrderId) {
+      const one = allOrders.find((o: any) => o.id === focusedOrderId);
+      return one ? [one] : [];
+    }
+    return allOrders.filter((o: any) =>
+      o.table_id === tableId && ACTIVE_ORDER_STATUSES.includes(o.status)
+    );
+  };
+
+  /**
+   * Same result as ordersForBilling, but fetched with a scoped query instead of
+   * pulling the whole orders table and filtering in memory. Used by the billing
+   * and print paths, which a busy till hits constantly.
+   */
+  const fetchOrdersForBilling = async (tableId: string): Promise<any[]> => {
+    const { localQuery } = await import('@/services/localDataService');
+    if (focusedOrderId) {
+      const res = await localQuery('orders', { id: focusedOrderId });
+      return res.data || [];
+    }
+    const res = await localQuery('orders', {
+      table_id: tableId,
+      status: ACTIVE_ORDER_STATUSES,
+    });
+    return res.data || [];
+  };
+
   // Load a SPECIFIC order (any status) into the cart — used by bill-number search
   // so a closed/served bill can be reopened to add items and be re-billed.
   const loadSpecificOrder = async (order: any) => {
@@ -851,6 +915,9 @@ export default function OrderKioskSplit() {
       setSelectedTable(tableObj);
       setCurrentOrderId(order.id);
       setCurrentBillNumber(order.bill_number ?? null);
+      // Pin every later action to THIS bill, so a running bill on the same table
+      // can never be folded into it.
+      setFocusedOrderId(order.id);
 
       const itemsRes = await localQuery('order_items', { order_id: order.id });
       const cartItems: UnifiedCartItem[] = [];
@@ -885,7 +952,11 @@ export default function OrderKioskSplit() {
     if (!q || !/^[0-9]+$/.test(q)) return;
     const db = getDataClient();
     if (!db) return;
-    db.query('orders', {}).then((result: any) => {
+    // Ask for just this bill number rather than reading every order in the
+    // database and scanning it in JavaScript. Bill numbers reset daily, so this
+    // returns only a handful of rows; the same "today, not cancelled" rule is
+    // then applied exactly as before.
+    db.query('orders', { bill_number: Number(q) }).then((result: any) => {
       const orders = result.data || [];
       const today = new Date().toDateString();
       const matchingOrder = orders.find((o: any) => {
@@ -1100,13 +1171,33 @@ export default function OrderKioskSplit() {
           // search to add items), re-activate it so the kitchen sees the new
           // items and the table shows occupied again.
           const reopened = ['served', 'completed'].includes(order.status);
+
+          // Only bring a closed bill back to life if the table has no other live
+          // bill. Re-activating it alongside a running bill would put TWO live
+          // bills on one table, and every by-table lookup (cart, billing, print)
+          // sums all live orders — which is exactly how a running bill got merged
+          // into a reopened past bill and printed under the past bill's number.
+          // In that case the reopened bill stays closed; it is still edited and
+          // reprinted on its own through the focused-order path.
+          let reactivate = reopened;
+          if (reopened && order.table_id) {
+            const sameTable = await db.query('orders', { table_id: order.table_id });
+            const otherLive = (sameTable.data || []).some((o: any) =>
+              o.id !== order.id && ['pending', 'cooking', 'ready'].includes(o.status)
+            );
+            if (otherLive) {
+              reactivate = false;
+              console.warn('[submitOrder] Table already has a running bill — keeping reopened bill closed to avoid merging.');
+            }
+          }
+
           await db.upsert('orders', {
             ...order,
             total_amount: newTotal,
-            status: reopened ? 'pending' : order.status,
+            status: reactivate ? 'pending' : order.status,
             updated_at: new Date().toISOString()
           });
-          if (reopened && order.table_id) {
+          if (reactivate && order.table_id) {
             const tRes = await db.query('tables', { id: order.table_id });
             if (tRes.data && tRes.data.length > 0) {
               await db.upsert('tables', { ...tRes.data[0], is_occupied: 1, updated_at: new Date().toISOString() });
@@ -1208,9 +1299,17 @@ export default function OrderKioskSplit() {
     setCurrentBillNumber(null);
       
       console.log('[submitOrder] Cart cleared, reloading order...');
-      
-      // Reload to show updated order
-      if (selectedTable) {
+
+      // Reload to show the updated order. If a specific past bill is open, reload
+      // THAT bill — reloading "the table" here would pull in the table's running
+      // bill and merge the two carts.
+      if (focusedOrderId) {
+        const res = await db.query('orders', { id: focusedOrderId });
+        if (res.data && res.data.length > 0) {
+          await loadSpecificOrder(res.data[0]);
+        }
+        console.log('[submitOrder] Focused bill reloaded:', focusedOrderId);
+      } else if (selectedTable) {
         await loadTableOrder(selectedTable);
         console.log('[submitOrder] Order reloaded successfully');
       }
@@ -1247,12 +1346,16 @@ export default function OrderKioskSplit() {
       return;
     }
 
+    // Whether the table still has a live bill after this settlement (true when a
+    // reopened past bill was settled while the table's own bill keeps running).
+    let tableStillRunning = false;
+
     const db = getDataClient();
     if (db) {
       const ordersRes = await db.query('orders', { table_id: tableId });
-      const activeOrders = (ordersRes.data || []).filter((order: any) =>
-        ['pending', 'cooking', 'ready'].includes(order.status)
-      );
+      // Settle only the bill being worked on. When a past bill is open, closing
+      // it must not also close the table's live running bill.
+      const activeOrders = ordersForBilling(ordersRes.data || [], tableId);
       let isPrimary = true;
       for (const order of activeOrders) {
         const update: Record<string, any> = {
@@ -1274,28 +1377,39 @@ export default function OrderKioskSplit() {
         isPrimary = false;
       }
       
-      // Update table to not occupied
-      const tablesRes = await db.query('tables', { id: tableId });
-      if (tablesRes.data && tablesRes.data.length > 0) {
-        const table = tablesRes.data[0];
-        await db.upsert('tables', {
-          ...table,
-          is_occupied: 0,
-          updated_at: new Date().toISOString()
-        });
+      // Free the table only if nothing is still running on it. Settling a
+      // reopened past bill must not clear a table that is still serving its
+      // live bill.
+      const settledIds = new Set(activeOrders.map((o: any) => o.id));
+      const stillRunning = (ordersRes.data || []).some((o: any) =>
+        !settledIds.has(o.id) && ['pending', 'cooking', 'ready'].includes(o.status)
+      );
+
+      if (!stillRunning) {
+        const tablesRes = await db.query('tables', { id: tableId });
+        if (tablesRes.data && tablesRes.data.length > 0) {
+          const table = tablesRes.data[0];
+          await db.upsert('tables', {
+            ...table,
+            is_occupied: 0,
+            updated_at: new Date().toISOString()
+          });
+        }
       }
+      tableStillRunning = stillRunning;
     }
 
     setFloors(floors.map(f => ({
       ...f,
-      tables: f.tables.map(t => 
-        t.id === tableId ? { ...t, is_occupied: false } : t
+      tables: f.tables.map(t =>
+        t.id === tableId ? { ...t, is_occupied: tableStillRunning } : t
       )
     })));
 
     setUnifiedCart([]);
     setCurrentOrderId(null);
     setCurrentBillNumber(null);
+    setFocusedOrderId(null);
     setSelectedTable(null);
 
     toast.success(`Payment received via ${paymentMethod.toUpperCase()}`);
@@ -1310,13 +1424,8 @@ export default function OrderKioskSplit() {
     
     try {
       const { localQuery } = await import('@/services/localDataService');
-      const ordersRes = await localQuery('orders');
-      
-      const orders = (ordersRes.data || []).filter((o: any) => 
-        o.table_id === table.id && 
-        ['pending', 'cooking', 'ready'].includes(o.status)
-      );
-      
+      const orders = await fetchOrdersForBilling(table.id);
+
       if (!orders || orders.length === 0) {
         toast.error('No active orders to bill');
         return;
@@ -1482,10 +1591,7 @@ export default function OrderKioskSplit() {
       }
 
       const { localQuery } = await import('@/services/localDataService');
-      const ordersRes = await localQuery('orders');
-      const orders = (ordersRes.data || []).filter((o: any) =>
-        o.table_id === selectedTable.id && ['pending', 'cooking', 'ready'].includes(o.status)
-      );
+      const orders = await fetchOrdersForBilling(selectedTable.id);
       if (orders.length === 0) {
         toast.error('No active order to print');
         return;
